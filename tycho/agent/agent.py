@@ -49,7 +49,7 @@ from tycho.harness.animation_evidence import (
 )
 from tycho.harness.agent import ActionChoice, Agent
 from tycho.harness.actions import normalize_game_actions
-from tycho.workspace.workspace import GameWorkspace, grid_text
+from tycho.workspace.workspace import GameWorkspace, diff_text, grid_text
 from tycho.workspace.agent_tools import tool_specs, ToolExecutor, ACTION_HINT, canonical
 from tycho.serving.llm_client import (
     LLMConfig,
@@ -216,9 +216,15 @@ class TychoAgent(Agent):
         self._edit_func = self.settings.edit_func
         wm_prompt_enabled = self._mode_spec.wm_variant != "none"
         actor_edit_func = self._edit_func and wm_prompt_enabled
+        # Multi-action commits: take_action may carry an `actions` sequence that the agent plays out
+        # without further LLM calls until a guard stops it (_batch_guard). 0 = upstream behaviour.
+        self.batch_max = self.settings.batch_max if self.settings.batch_actions else 0
+        self.batch_noop_guard_from_level = self.settings.batch_noop_guard_from_level
+        self.batch_border = self.settings.batch_border
         self._tools_spec = tools or tool_specs(flavor, include_builder=self._orchestrator,
                                                include_edit_func=actor_edit_func,
-                                               world_model_enabled=wm_prompt_enabled)
+                                               world_model_enabled=wm_prompt_enabled,
+                                               batch_max=self.batch_max)
         # PER-MODEL vision profile (single source of truth, vision.py): render scale + whether THIS
         # model's encoder sees the image losslessly per cell. Drives BOTH the PNG render scale and
         # the perception sentence — decoupled (lossless ⊥ text-inlined). lossless_cells is asserted
@@ -231,7 +237,8 @@ class TychoAgent(Agent):
         self._sys = render_prompt(
             "actor.system", colormap=_COLORMAP, wm_variant=self._mode_spec.wm_variant,
             vision=self.vision, show_grid=self.show_grid, show_diff=self.show_diff,
-            lossless_cells=_img_lossless, meta_reflect=self.settings.meta_reflect)
+            lossless_cells=_img_lossless, meta_reflect=self.settings.meta_reflect,
+            batch_actions=self.batch_max > 0, batch_max=self.batch_max)
         self.animation_summary_enabled = self.settings.animation_summary and self.vision
         self.animation_summary_video_enabled = (
             self.settings.animation_summary_video and _supports_animation_video(self.cfg)
@@ -342,6 +349,9 @@ class TychoAgent(Agent):
         self._reset_animation_summary_level_state()
         self._turn_animation_summaries: list = []
         self._last_tool_trace: list = []
+        self._batch: dict | None = None            # the action sequence being played out, if any
+        self._prepared_batch: dict | None = None   # a sequence validated this turn, not yet committed
+        self._batch_report: dict | None = None     # how the last sequence ended; shown next turn
         # Proprietary GPT reasoning is hidden, but Responses-backed transports can retain it behind
         # an opaque response ID. The chain is reset at level/reset boundaries and by context rescue.
         # Stored opaque reasoning can improve continuity, but its server-side context cannot be
@@ -500,6 +510,14 @@ class TychoAgent(Agent):
         state = str(latest_frame.state).replace("GameState.", "")
         levels_done = latest_frame.levels_completed
 
+        # --- MULTI-ACTION SEQUENCE: play the next queued action without an LLM call while no guard
+        # fires; otherwise close the sequence and fall through to a normal turn, which reports it.
+        if getattr(self, "_batch", None) is not None:
+            stop = self._batch_guard(latest_frame, avail, game_avail)
+            if stop is None and self._batch["queue"]:
+                return self._continue_batch(latest_frame, available_actions, avail, game_avail, state)
+            self._finish_batch(stop, grid)
+
         # --- LEVEL TRANSITION: levels_completed rose since last turn → a level was just solved.
         # First consolidate the just-finished level while the old-level transcript is still present;
         # then reset history and present the next level as a fresh decision problem. ---
@@ -549,6 +567,10 @@ class TychoAgent(Agent):
                 level_just_completed=level_just_completed,
             ))
         frame_boundary = getattr(self, "_pending_frame_boundary", None)
+        batch_report = getattr(self, "_batch_report", None)
+        self._batch_report = None
+        if batch_report is not None:
+            content.append({"text": batch_report["text"]})
         content.append({"text": self._frame_message(grid, state, avail, frame_boundary)})
         self._pending_frame_boundary = None
         png = self.ws.current_png(self.level, self.turn_in_level) if self.vision else None
@@ -596,7 +618,11 @@ class TychoAgent(Agent):
         elif self.dispatcher is not None and self.turn_in_level == 0 and self.level > 0 \
                 and self.calls < self.max_calls:
             self._dispatch(Event.LEVEL_START, {"level": self.level, "at_level_start": True})
+        self._prepared_batch = None
         choice, trace = self._run_until_action(available_actions)
+        prepared, self._prepared_batch = self._prepared_batch, None
+        if prepared is not None and choice is prepared["first"]:
+            self._start_batch(prepared, grid, game_avail)
         self._last_tool_trace = trace
         token_delta = {
             k: int(self.token_stats.get(k, 0)) - int(_token_stats_before.get(k, 0))
@@ -622,6 +648,10 @@ class TychoAgent(Agent):
             choice.reasoning["builder_runs"] = self._turn_builder_runs
         if self._turn_animation_summaries:
             choice.reasoning["animation_summaries"] = self._turn_animation_summaries
+        if batch_report is not None:
+            choice.reasoning["batch_report"] = batch_report["data"]
+        if self._batch is not None:
+            choice.reasoning["batch"] = {"i": 0, "n": self._batch["planned"]}
         # track in (row, col) for the next turn's metadata (engine x/y → row/col)
         r = (choice.reasoning or {}).get("row")
         c = (choice.reasoning or {}).get("col")
@@ -1479,6 +1509,8 @@ class TychoAgent(Agent):
         verifier cannot learn a fake "lethal action -> reset frame" transition.
         """
         archived = None
+        if getattr(self, "_batch", None) is not None:
+            self._finish_batch("game_over", None)
         self._last_action = None
         self._last_row = None
         self._last_col = None
@@ -1978,6 +2010,46 @@ class TychoAgent(Agent):
         return ActionChoice(a, reasoning={"src": "default (tool cap)"}), trace
 
     def _prepare_take_action(self, args: dict, available_actions) -> tuple[ActionChoice | None, dict | None, str]:
+        """Validate a take_action call. A multi-action `actions` list (when enabled) is validated as a
+        whole; nothing is committed unless every entry is legal. A valid sequence of two or more is
+        parked in _prepared_batch, and choose_action starts it only if its first choice is the one
+        _run_until_action actually commits (not a deferred or superseded call)."""
+        self._prepared_batch = None
+        steps = args.get("actions") if isinstance(args, dict) else None
+        if getattr(self, "batch_max", 0) > 0 and isinstance(steps, list) and steps:
+            return self._prepare_sequence(steps, available_actions)
+        return self._prepare_single_action(args, available_actions)
+
+    def _prepare_sequence(self, steps: list, available_actions) -> tuple[ActionChoice | None, dict | None, str]:
+        dropped = max(0, len(steps) - self.batch_max)
+        steps = steps[:self.batch_max]
+        n = len(steps)
+        parsed: list[dict] = []
+        trace_steps: list[dict] = []
+        first = None
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict):
+                return None, None, (
+                    f"Invalid take_action sequence: entry {i + 1} of {n} is not an object like "
+                    "{\"action\": \"ACTION1\"}. No action was committed.")
+            if i > 0 and str(step.get("action", "")).upper() == "RESET":
+                return None, None, (
+                    f"Invalid take_action sequence: RESET at position {i + 1}. RESET may only be the "
+                    "first action of a sequence. No action was committed.")
+            choice, step_args, err = self._prepare_single_action(step, available_actions)
+            if err:
+                detail = err.removeprefix("Invalid take_action: ")
+                return None, None, (
+                    f"Invalid take_action sequence: action {i + 1} of {n}: {detail}")
+            if first is None:
+                first = choice
+            parsed.append(step_args)
+            trace_steps.append(step_args)
+        if n > 1:
+            self._prepared_batch = {"first": first, "steps": parsed, "dropped": dropped}
+        return first, (trace_steps[0] if n == 1 else {"actions": trace_steps, "dropped": dropped}), ""
+
+    def _prepare_single_action(self, args: dict, available_actions) -> tuple[ActionChoice | None, dict | None, str]:
         by_name = {a.name: a for a in available_actions}
         requested = str(args.get("action", "")).upper()
         if requested not in by_name:
@@ -2009,6 +2081,127 @@ class TychoAgent(Agent):
             trace_args["row"] = getattr(choice, "y", None)
             trace_args["col"] = getattr(choice, "x", None)
         return choice, trace_args, ""
+
+    # ---- multi-action sequences (TYCHO_BATCH_ACTIONS) -------------------------------------------
+    # The first action of a sequence leaves through the normal turn path. Each later one is returned by
+    # _continue_batch on the next choose_action call: the frame is recorded in the workspace as usual
+    # (so wmlib.frames()/transitions() and world_model.py see every step), but no user message, image,
+    # animation summary or LLM call is spent. The next real turn opens with a report of what ran.
+
+    def _start_batch(self, prepared: dict, grid, game_avail: list[str]) -> None:
+        steps = prepared["steps"]
+        self._batch = {
+            "queue": list(steps[1:]),
+            "labels": [self._action_label(s["action"], row=s.get("row"), col=s.get("col")) for s in steps],
+            "planned": len(steps),
+            "executed": 1,  # the first action is returned by this turn
+            "dropped": prepared.get("dropped", 0),
+            "start_turn": self.turn_in_level,
+            "start_level": self.level,
+            "start_grid": [list(map(int, row)) for row in grid],
+            "prev_grid": [list(map(int, row)) for row in grid],
+            "game_actions": sorted(game_avail),
+        }
+
+    def _batch_guard(self, latest_frame, avail: list[str], game_avail: list[str]) -> str | None:
+        """Why the running sequence must stop before its next action, or None to continue."""
+        b = self._batch
+        if int(latest_frame.levels_completed) > int(self.prev_levels_done):
+            return "level_completed"
+        state = str(latest_frame.state).replace("GameState.", "")
+        if state != "NOT_FINISHED":
+            return f"state_{state.lower()}"
+        if sorted(game_avail) != b["game_actions"]:
+            return "available_actions_changed"
+        if b["queue"] and b["queue"][0]["action"] not in avail:
+            return "next_action_unavailable"
+        grid = latest_frame.frame[-1]
+        if (getattr(self, "_last_action", None) not in (None, "RESET")
+                and self.level >= self.batch_noop_guard_from_level
+                and not _interior_changed(b["prev_grid"], grid, self.batch_border)):
+            return "no_op"
+        if self._mode_spec.wm_variant != "none":
+            hint = self.ws.validated_plan_hint(grid, level=self.level, turn=self.turn_in_level, available=avail)
+            if hint and "diverged" in hint:
+                return "plan_diverged"
+        return None
+
+    def _continue_batch(self, latest_frame, available_actions, avail: list[str], game_avail: list[str],
+                        state: str) -> ActionChoice:
+        grid = latest_frame.frame[-1]
+        self.ws.record(grid, level=self.level, turn_in_level=self.turn_in_level,
+                       action=getattr(self, "_last_action", None) if self.turn_in_level > 0 else None,
+                       row=getattr(self, "_last_row", None), col=getattr(self, "_last_col", None),
+                       state=state, available=avail)
+        self.exec.cur_grid = [list(map(int, row)) for row in grid]
+        self.exec.available = game_avail
+        self.prev_levels_done = latest_frame.levels_completed
+        b = self._batch
+        b["prev_grid"] = [list(map(int, row)) for row in grid]
+        step = b["queue"].pop(0)
+        choice = self._to_choice(step, available_actions)
+        choice.reasoning = {**(choice.reasoning or {}), "src": "batch",
+                            "i": b["executed"], "n": b["planned"], "t": self.t, "calls": self.calls,
+                            "level": self.level, "turn_in_level": self.turn_in_level,
+                            "token_stats": dict(self.token_stats)}
+        b["executed"] += 1
+        self._last_action = choice.action.name
+        self._last_committed_control = choice.action.name
+        r = choice.reasoning.get("row")
+        c = choice.reasoning.get("col")
+        self._last_row = r if r is not None else getattr(choice, "y", None)
+        self._last_col = c if c is not None else getattr(choice, "x", None)
+        self.t += 1
+        self.turn_in_level += 1
+        return choice
+
+    def _finish_batch(self, stop: str | None, grid) -> None:
+        """Close the running sequence and queue its report for the next turn's message."""
+        b, self._batch = self._batch, None
+        if b is None:
+            return
+        k, n = b["executed"], b["planned"]
+        ran, skipped = b["labels"][:k], b["labels"][k:]
+        last = ran[-1] if ran else "?"
+        head = f"[sequence report] You committed a sequence of {n} actions."
+        if b["dropped"]:
+            head += (f" Only the first {self.batch_max} were accepted; the {b['dropped']} after them "
+                     "were dropped and never executed.")
+        skip_txt = (f" Actions {k + 1}-{n} ({', '.join(skipped)}) were SKIPPED and did not execute."
+                    if skipped else "")
+        if stop is None:
+            body = f" All {n} executed: {', '.join(ran)}."
+        elif stop == "level_completed":
+            body = (f" Executed {k} of {n}: {', '.join(ran)}. Action {k} ({last}) completed the level."
+                    f"{skip_txt}")
+        elif stop == "game_over":
+            body = (f" Executed {k} of {n}: {', '.join(ran)}. Action {k} ({last}) caused GAME_OVER and "
+                    f"the level was reset.{skip_txt}")
+        elif stop == "no_op":
+            body = (f" Executed {k} of {n}: {', '.join(ran)}. Action {k} ({last}) EXECUTED but produced "
+                    f"no change inside the board area; only the outer {self.batch_border} cells, where a "
+                    f"timer or step counter usually sits, could have changed.{skip_txt} Do NOT update "
+                    "your position estimate by counting submitted moves; re-locate from the current "
+                    "frame before planning. Batching is still the right approach: the stop is what keeps "
+                    "a wrong movement model from costing the whole sequence.")
+        elif stop in ("available_actions_changed", "next_action_unavailable"):
+            body = (f" Executed {k} of {n}: {', '.join(ran)}. After action {k} ({last}) the available "
+                    f"actions changed, so the sequence stopped.{skip_txt}")
+        elif stop == "plan_diverged":
+            body = (f" Executed {k} of {n}: {', '.join(ran)}. After action {k} ({last}) the observed "
+                    f"frame diverged from the validated plan's trajectory; re-plan from the current "
+                    f"frame.{skip_txt}")
+        else:
+            body = f" Executed {k} of {n}: {', '.join(ran)}. Stopped ({stop}).{skip_txt}"
+        text = head + body
+        same_attempt = stop not in ("level_completed", "game_over") and self.level == b["start_level"]
+        if same_attempt and grid is not None and self.turn_in_level > b["start_turn"]:
+            ld = f"level_{self.level}"
+            text += (f"\nIntermediate frames: {ld}/turn_{b['start_turn'] + 1:03d}.txt to "
+                     f"turn_{self.turn_in_level:03d}.txt. Cell changes over the whole sequence:\n"
+                     + _clip_trace(diff_text(b["start_grid"], [list(map(int, row)) for row in grid]), cap=2500))
+        self._batch_report = {"text": text, "data": {"planned": n, "executed": k, "stop": stop,
+                                                     "skipped": len(skipped), "dropped": b["dropped"]}}
 
     @staticmethod
     def _valid_click_coord(v) -> bool:
@@ -2131,7 +2324,10 @@ class TychoAgent(Agent):
         specs = copy.deepcopy(self._tools_spec)
         for spec in specs:
             if canonical(spec.get("name", "")) == "take_action":
-                spec["schema"]["properties"]["action"]["enum"] = list(available)
+                props = spec["schema"]["properties"]
+                props["action"]["enum"] = list(available)
+                if "actions" in props:
+                    props["actions"]["items"]["properties"]["action"]["enum"] = list(available)
                 break
         return specs
 
@@ -2315,6 +2511,25 @@ class TychoAgent(Agent):
         # Provider reasoning payloads are not prefix-cache-stable and dominate long contexts. Evict
         # Anthropic raw_reasoning and GPT reasoning_items on the same policy in every context mode.
         self._truncate_old_reasoning()
+
+
+def _interior_changed(prev, cur, border: int) -> bool:
+    """Whether any cell more than `border` cells from the edge differs between two grids.
+
+    A timer or step-counter bar along the edge changes on every action, including moves into a wall;
+    the interior test separates those no-ops from real gameplay changes (Franzen's
+    `_interior_gameplay_changed`). A shape change counts as a change."""
+    rows_prev, rows_cur = list(prev), list(cur)
+    if len(rows_prev) != len(rows_cur):
+        return True
+    n = len(rows_cur)
+    for r in range(border, n - border):
+        a, b = list(rows_prev[r]), list(rows_cur[r])
+        if len(a) != len(b):
+            return True
+        if [int(x) for x in a[border:len(a) - border]] != [int(x) for x in b[border:len(b) - border]]:
+            return True
+    return False
 
 
 def _is_heavy(p) -> bool:

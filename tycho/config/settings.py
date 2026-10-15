@@ -61,6 +61,10 @@ class TychoSettings:
     animation_summary_max_keyframes: int
     animation_summary_include_game_over: bool
     animation_summary_max_tokens: int
+    batch_actions: bool          # take_action accepts an `actions` list (multi-action commit)
+    batch_max: int               # most actions one take_action may commit
+    batch_noop_guard_from_level: int  # 0-based level from which a no-op action stops a batch
+    batch_border: int            # outer cells ignored by the batch no-op guard
 
     # ---- derived (not env): the two text-grid toggles _frame_message reads ----
     @property
@@ -110,6 +114,10 @@ class TychoSettings:
             animation_summary_max_keyframes=_envint("TYCHO_ANIMATION_SUMMARY_MAX_KEYFRAMES", 6),
             animation_summary_include_game_over=_envbool("TYCHO_ANIMATION_SUMMARY_INCLUDE_GAME_OVER", default=True),
             animation_summary_max_tokens=_envint("TYCHO_ANIMATION_SUMMARY_MAX_TOKENS", 700),
+            batch_actions=_envbool("TYCHO_BATCH_ACTIONS"),
+            batch_max=_envint("TYCHO_BATCH_MAX", 24),
+            batch_noop_guard_from_level=_envint("TYCHO_BATCH_NOOP_GUARD_FROM_LEVEL", 1),
+            batch_border=_envint("TYCHO_BATCH_BORDER", 4),
         )
         s._validate()
         return s
@@ -131,6 +139,10 @@ class TychoSettings:
             raise ValueError("animation_summary_max_keyframes must be >= 2")
         if self.animation_summary_max_tokens < 1:
             raise ValueError("animation_summary_max_tokens must be >= 1")
+        if self.batch_max < 1:
+            raise ValueError("batch_max must be >= 1")
+        if self.batch_noop_guard_from_level < 0 or self.batch_border < 0:
+            raise ValueError("batch_noop_guard_from_level and batch_border must be >= 0")
         if self.animation_summary_video_format not in ("images", "jpeg_frames", "gif"):
             raise ValueError("animation_summary_video_format must be images|jpeg_frames|gif")
 

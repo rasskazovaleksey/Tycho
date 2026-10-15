@@ -67,6 +67,11 @@ CONFIG_KEYS: list[ConfigKey] = [
     ConfigKey("TYCHO_MAX_INFERENCE_COST_PER_GAME", "reasoning", "0", "public-list USD-equivalent inference budget per game (0 = off)"),
     ConfigKey("TYCHO_MAX_INFERENCE_COST_PER_LEVEL", "reasoning", "0", "public-list USD-equivalent inference budget per level (0 = off)"),
     ConfigKey("TYCHO_MAX_TOOL_STEPS", "reasoning", "25", "cognitive tool calls/turn before forced action"),
+    # ---- multi-action commits (take_action `actions` list, executed with early-stop guards) ----
+    ConfigKey("TYCHO_BATCH_ACTIONS", "actions", "0", "take_action accepts an `actions` list executed without further LLM calls"),
+    ConfigKey("TYCHO_BATCH_MAX", "actions", "24", "most actions one take_action may commit"),
+    ConfigKey("TYCHO_BATCH_NOOP_GUARD_FROM_LEVEL", "actions", "1", "0-based level from which a no-op action stops a batch"),
+    ConfigKey("TYCHO_BATCH_BORDER", "actions", "4", "outer cells ignored by the batch no-op guard (timer/step bars)"),
     ConfigKey("TYCHO_WALLCLOCK_BUDGET_SECONDS", "runtime", "0", "whole-run wall-clock guard"),
     ConfigKey("TYCHO_PER_GAME_WALLCLOCK_BUDGET_SECONDS", "runtime", "0", "per-game wall-clock guard"),
     ConfigKey("TYCHO_SANDBOX_RUNTIME", "runtime", "auto", "auto | docker | finch"),

@@ -209,16 +209,42 @@ _SCHEMAS = {
 
 _ORDER = ["ls", "read_file", "write_file", "edit_file", "run_python", "set_verbosity", "take_action"]
 
+# Multi-action commit (TYCHO_BATCH_ACTIONS): take_action also accepts `actions`, executed in order by
+# the agent without further LLM calls until a guard stops it (see TychoAgent._batch_guard).
+_TAKE_ACTION_BATCH_DESCRIPTION = (
+    "Commit environment controls; this ENDS the turn and the resulting frame arrives next. Either "
+    "ONE control: action (e.g. \"ACTION1\" or \"RESET\"; for ACTION6 (click) also integer row and "
+    "col, 0-63, matching the grid's y/x labels), or a SEQUENCE: actions, a list of {action, row?, "
+    "col?} executed in order, up to {batch_max}. A sequence stops early, skipping the rest, when the "
+    "level completes, the game ends, an action changes nothing inside the board, the available "
+    "actions change, or a validated plan's trajectory diverges; the next turn reports what ran and "
+    "why it stopped. RESET may only be the first action of a sequence. Examples: "
+    "{\"action\":\"ACTION6\",\"row\":40,\"col\":12} or "
+    "{\"actions\":[{\"action\":\"ACTION4\"},{\"action\":\"ACTION4\"},{\"action\":\"ACTION1\"}]}."
+)
+
+
+def _take_action_batch_schema(batch_max: int) -> dict:
+    step = {"type": "object", "properties": {"action": {"type": "string"},
+                                              "row": {"type": "integer"}, "col": {"type": "integer"}},
+            "required": ["action"]}
+    return {"type": "object", "properties": {
+        "action": {"type": "string"}, "row": {"type": "integer"}, "col": {"type": "integer"},
+        "actions": {"type": "array", "items": step, "maxItems": batch_max},
+    }}
+
 
 def tool_specs(flavor: str = "generic", include_builder: bool = False,
                include_edit_func: bool = False, world_model_enabled: bool = True,
                include_take_action: bool = True,
-               include_set_verbosity: bool = True) -> list[dict]:
+               include_set_verbosity: bool = True,
+               batch_max: int = 0) -> list[dict]:
     """Build a model-flavored tool surface.
 
     ``include_builder`` adds the actor-only builder handoff, ``include_edit_func`` adds the
     function-granular Python editor, and ``include_set_verbosity`` controls the actor's persistent
     frame-display setting. Builders use the editor but omit verbosity and environment actions.
+    ``batch_max > 0`` lets take_action commit a sequence of up to that many actions.
     """
     names = _FLAVOR_NAMES.get(flavor, _FLAVOR_NAMES["generic"])
     order = [c for c in _ORDER if include_take_action or c != "take_action"]
@@ -233,7 +259,11 @@ def tool_specs(flavor: str = "generic", include_builder: bool = False,
     out = []
     for c in order:
         desc = _RUN_PYTHON_NO_WM_DESCRIPTION if (c == "run_python" and not world_model_enabled) else _DESCRIPTIONS[c]
-        out.append({"name": names[c], "description": desc, "schema": _SCHEMAS[c]})
+        schema = _SCHEMAS[c]
+        if c == "take_action" and batch_max > 0:
+            desc = _TAKE_ACTION_BATCH_DESCRIPTION.replace("{batch_max}", str(batch_max))
+            schema = _take_action_batch_schema(batch_max)
+        out.append({"name": names[c], "description": desc, "schema": schema})
     return out
 
 
