@@ -42,7 +42,18 @@ DEFAULT_CACHE_ROLLING_EVERY = 1        # 1 = historical "write a rolling cache p
 #                context but mutates the prefix → cache-HOSTILE. (was "legacy")
 #   collapse   — DEPRECATED: collapse prior turns to just the committed action. Known RHAE regression.
 #                (was "rolling") — kept only so old invocations resolve, not recommended.
-_HISTORY_VALUES = {"tail_evict", "truncate", "collapse"}
+#   drain      — append-only transcript that is never edited turn to turn (no image/reasoning/text
+#                stripping). Once the prompt passes TYCHO_CONTEXT_BUDGET_TOKENS (or the image count
+#                passes image_cap) the oldest whole frame-turns are dropped in ONE batch, down to
+#                budget - TYCHO_CONTEXT_DRAIN_TOKENS. The prefix-cache discipline of Franzen's harness
+#                (M0: 94% prompt-cache reuse vs 50-68% for tail_evict on Qwen, whose image cap stripped
+#                an image every turn).
+_HISTORY_VALUES = {"tail_evict", "truncate", "collapse", "drain"}
+
+# drain-mode defaults: Franzen's harness on the same server (131072 window - 12288 reply - 512 margin;
+# ARC3_CONTEXT_DRAIN_TOKENS).
+DEFAULT_DRAIN_BUDGET_TOKENS = 118272
+DEFAULT_DRAIN_TOKENS = 59392
 _OLD_HISTORY_MAP = {"cache": "tail_evict", "legacy": "truncate", "rolling": "collapse"}
 
 
@@ -82,7 +93,7 @@ def cache_rolling_every() -> int:
 
 
 def _resolve_history() -> str:
-    """New name TYCHO_HISTORY (tail_evict|truncate|collapse); falls back to the old
+    """New name TYCHO_HISTORY (tail_evict|truncate|collapse|drain); falls back to the old
     TYCHO_CONTEXT_MODE (cache|legacy|rolling); default tail_evict. Unknown value → raise (no silent
     degrade to a catch-all)."""
     raw = os.environ.get("TYCHO_HISTORY")
@@ -106,7 +117,7 @@ class ContextConfig:
     that bundles behaviours. Log .resolved() at startup + stamp it in the manifest so a silent
     revert is visible."""
     prompt_caching: bool
-    history: str                 # tail_evict | truncate | collapse
+    history: str                 # tail_evict | truncate | collapse | drain
     image_keep: int              # images retained before tail-eviction kicks in
     image_evict_mult: int        # batched-eviction threshold multiplier
     image_cap: int               # HARD ceiling on images/request (<= server --limit-mm-per-prompt)
@@ -120,6 +131,8 @@ class ContextConfig:
     emergency_keep_turns: int     # contiguous frame-turn suffix retained in emergency seed
     emergency_recent_actions: int # action trace retained in emergency seed
     emergency_tool_results: int   # recent tool outputs retained in emergency seed
+    drain_budget_tokens: int      # drain mode: prompt tokens that trigger a drain
+    drain_tokens: int             # drain mode: tokens freed below the budget by one drain
 
     def resolved(self) -> dict:
         return asdict(self)
@@ -133,6 +146,9 @@ class ContextConfig:
         if not self.prompt_caching and self.history == "tail_evict":
             w.append("history=tail_evict but prompt_caching=off: you keep an append-only prefix but "
                      "send no explicit cache markers; automatic prefix caches may still apply.")
+        if self.history == "drain" and self.drain_tokens >= self.drain_budget_tokens:
+            w.append(f"drain_tokens={self.drain_tokens} >= drain_budget_tokens={self.drain_budget_tokens}: "
+                     "every drain empties the level transcript down to the current turn.")
         if self.history == "collapse":
             w.append("history=collapse is DEPRECATED (known RHAE regression) — prefer tail_evict.")
         if self.image_keep > self.image_cap:
@@ -169,4 +185,8 @@ def resolve_context_config(grid_keep_default: int = 3) -> ContextConfig:
         emergency_keep_turns=max(1, int(os.environ.get("TYCHO_CONTEXT_EMERGENCY_KEEP_TURNS", "6") or 6)),
         emergency_recent_actions=max(1, int(os.environ.get("TYCHO_CONTEXT_EMERGENCY_RECENT_ACTIONS", "24") or 24)),
         emergency_tool_results=max(0, int(os.environ.get("TYCHO_CONTEXT_EMERGENCY_TOOL_RESULTS", "4") or 4)),
+        drain_budget_tokens=max(1, int(os.environ.get("TYCHO_CONTEXT_BUDGET_TOKENS", str(DEFAULT_DRAIN_BUDGET_TOKENS))
+                                       or DEFAULT_DRAIN_BUDGET_TOKENS)),
+        drain_tokens=max(0, int(os.environ.get("TYCHO_CONTEXT_DRAIN_TOKENS", str(DEFAULT_DRAIN_TOKENS))
+                                or DEFAULT_DRAIN_TOKENS)),
     )

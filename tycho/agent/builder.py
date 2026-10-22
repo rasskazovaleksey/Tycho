@@ -20,6 +20,8 @@ from tycho.agent.colors import COLORMAP   # shared with the actor so they speak 
 from tycho.prompts.render import render_prompt  # builder.system.j2 + builder.user.j2
 
 REPORT_FILE = "notes/world_model_report.md"
+# a line only the untouched seed world_model.py contains (templates/seed_world_model.py.tmpl)
+_SEED_MARKER = '# e.g. if action["action"] == "ACTION1": <move something in s>'
 
 # meta-reflection on the builder is gated by the same TYCHO_META_REFLECT flag as the actor (dev aid:
 # the builder is where world-model-API friction surfaces, so its feedback is especially valuable).
@@ -328,8 +330,13 @@ class WorldModelBuilder:
                     "note: continue from the current observations; the builder did not run."), []
         ws = self.exec.ws
         available_actions = list(available_actions or [])
+        # TYCHO_BUILDER_STARTER: a first-model recipe while world_model.py is still the seed. In the 2 h
+        # Qwen run 21 of 24 orchestrator workspaces still held the seed transition() at the end.
+        starter = (os.environ.get("TYCHO_BUILDER_STARTER", "") in ("1", "on", "true", "yes")
+                   and _SEED_MARKER in ws.read_file("world_model.py", max_bytes=200000))
         kickoff = render_prompt("builder.user", level=level, hint=hint,
-                                available_actions=available_actions, report_file=REPORT_FILE)
+                                available_actions=available_actions, report_file=REPORT_FILE,
+                                starter=starter)
         # Auto-attach the current verify state up front so the builder doesn't have to spend its
         # first 2–4 tool calls running verify + diffing frames itself (it always would). When the
         # verify state names a first_divergence, ALSO attach the two PNGs (prev frame + observed

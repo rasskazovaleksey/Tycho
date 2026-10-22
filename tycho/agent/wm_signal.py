@@ -61,6 +61,9 @@ try:
     if v.get("errors"):
         print("DYN:NOMODEL")                          # a crashing model can't predict → needs building
     else:
+        _fd = v.get("first_divergence")
+        print("STATS:%d/%d|%s" % (int(v.get("n_matched") or 0), int(v.get("n_changing") or 0),
+                                  str(_fd)[:200].replace("\n", " ") if _fd else ""))
         if not v.get("n_changing"):
             print("DYN:ACCURATE"); dyn_ok = True       # nothing graded observed anywhere yet
         else:
@@ -113,9 +116,17 @@ def wm_signal(executor) -> dict:
     out = executor._run_python(_WM_SIGNAL_PROBE, timeout=20)
     dyn = "NOMODEL"
     outcome = None
+    stats = None
     for line in (out or "").splitlines():
         line = line.strip()
-        if line.startswith("DYN:"):
+        if line.startswith("STATS:"):
+            counts, _, first = line[6:].partition("|")
+            try:
+                matched, evaluated = (int(x) for x in counts.split("/"))
+                stats = (matched, evaluated, first)
+            except ValueError:
+                stats = None
+        elif line.startswith("DYN:"):
             dyn = line[4:]
         elif line.startswith("OUTCOME:"):
             outcome = line[8:]
@@ -132,6 +143,7 @@ def wm_signal(executor) -> dict:
         # / no output) → run, to bootstrap or fix a model.
         "dynamics_inaccurate": dyn != "ACCURATE",
         "outcome_divergence": (outcome if outcome in valid_outcome_divergences else None),
+        "stats": stats,  # (matched, evaluated, first divergence) when a model imported and verified
     }
 
 

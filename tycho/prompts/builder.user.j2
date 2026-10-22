@@ -3,3 +3,12 @@
     empty), available_actions, report_file. Matches the old f-string in builder.build(). -#}
 You were invoked at level {{ level }}{% if available_actions %}. Current legal actions for the actor are: {{ available_actions | join(', ') }}{% endif %}. {{ hint }}
 First read notes/actor_beliefs.md (the actor's current hypotheses — a starting point, not ground truth; verify before encoding), notes/world_model.md (your scratchpad from earlier invocations), and notes/animation_evidence.md if it exists (auxiliary summaries of transient animations). Then inspect the observed transitions, build/refine world_model.py, update notes/world_model.md with what you learned this pass, write your report to {{ report_file }}, and reply 'done'.
+{% if starter is defined and starter %}
+
+world_model.py is still the untouched seed: its transition() changes nothing, so it explains none of the observed transitions. Replace it this pass with the smallest model that reproduces the COMMONEST transition, then grow it:
+1. In run_python, diff two consecutive frames from `transitions` and name the object that changed (e.g. the 5x5 block that moved 6 cells down on ACTION2).
+2. State = the static background grid plus that object's position (and anything else that visibly changed).
+3. transition() moves the object for each action you have seen; for an action whose effect you have not seen, leave the state unchanged.
+4. render() pastes the object onto the background. Use UNKNOWN (-1) only for cells you truly cannot predict.
+5. Save, read the automatic verify feedback, fix the first divergence, repeat. A partial model that reproduces most transitions is worth far more than the seed.
+{% endif %}

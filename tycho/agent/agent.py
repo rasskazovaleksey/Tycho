@@ -146,6 +146,15 @@ class TychoAgent(Agent):
         # this budget and decodes at ~57 tok/s, so it remains the main wall-clock lever there.
         self.max_tokens = self.settings.max_tokens
         self.retry_max_tokens = self.settings.retry_max_tokens
+        self.strict_receipts = self.settings.strict_receipts
+        self.scribe_max_calls = self.settings.scribe_max_calls
+        self.scribe_max_tokens = self.settings.scribe_max_tokens
+        self.builder_gate = self.settings.builder_gate
+        self.builder_stuck_tokens = self.settings.builder_stuck_tokens
+        self.builder_stuck_deaths = self.settings.builder_stuck_deaths
+        self.builder_max_per_level = self.settings.builder_max_per_level
+        self.wm_status_line = self.settings.wm_status_line
+        self.plan_batch_hint = self.settings.plan_batch_hint
         # H017 perception ablations — TYCHO_TEXT_GRID (full|diff|none) sets the STARTING grid/diff
         # toggles (show_grid/show_diff are derived properties on Settings); the agent can flip them
         # mid-game via set_verbosity. TYCHO_GRID_EMBEDS attaches the exact per-cell prompt_embeds.
@@ -271,6 +280,8 @@ class TychoAgent(Agent):
         self.context_emergency_keep_turns = self._ctx_cfg.emergency_keep_turns
         self.context_emergency_recent_actions = self._ctx_cfg.emergency_recent_actions
         self.context_emergency_tool_results = self._ctx_cfg.emergency_tool_results
+        self.context_drain_budget = self._ctx_cfg.drain_budget_tokens
+        self.context_drain_tokens = self._ctx_cfg.drain_tokens
         # Hard ceiling on images per request — MUST be <= the server's --limit-mm-per-prompt image,
         # or vLLM 400s. Batched eviction is gated on a threshold that can exceed this cap, so the cap
         # is a non-negotiable backstop after the batched pass. Default 4 matches common servers.
@@ -328,7 +339,7 @@ class TychoAgent(Agent):
                                                 include_edit_func=True,
                                                 include_take_action=False,
                                                 include_set_verbosity=False),
-                effort=self.effort, max_tokens=self.max_tokens)
+                effort=self.effort, max_tokens=self.settings.builder_max_tokens or self.max_tokens)
         # trigger mode: the harness-side scheduler that fires the builder on (action committed ∧
         # world model mispredicts), rate-limited. None in single/orchestrator (additive — those
         # modes never consult it).
@@ -338,6 +349,7 @@ class TychoAgent(Agent):
             self.dispatcher = TriggerDispatcher()
         self.builder_invocations = 0
         self._turn_builder_runs: list = []   # builder runs recorded in the current turn
+        self._reset_level_counters()
         self._build_agent_graph()
         self.t = 0                        # global trace turn
         self.level = 0                    # current level
@@ -530,6 +542,7 @@ class TychoAgent(Agent):
             self.level += 1
             self.turn_in_level = 0
             self._reset_animation_summary_level_state()
+            self._reset_level_counters()
             self.ws.new_level()               # fresh grid; no cross-level diff
             self.reset_reasoning_chain()      # SERVER chain re-establishes from the (now-empty) history
             self._pending_frame_boundary = "level_start"
@@ -591,7 +604,7 @@ class TychoAgent(Agent):
         # prior turn above, so it has nothing per-turn to trim.
         if self.context_mode == "tail_evict":
             self._cache_mode_evict_if_needed()
-        elif self.context_mode != "collapse":
+        elif self.context_mode not in ("collapse", "drain"):  # drain trims only in _drain_history
             self._truncate_old_grids()
 
         _token_stats_before = dict(self.token_stats)
@@ -618,6 +631,8 @@ class TychoAgent(Agent):
         elif self.dispatcher is not None and self.turn_in_level == 0 and self.level > 0 \
                 and self.calls < self.max_calls:
             self._dispatch(Event.LEVEL_START, {"level": self.level, "at_level_start": True})
+        if self._stuck_builder_due():
+            self._run_stuck_builder()
         self._prepared_batch = None
         choice, trace = self._run_until_action(available_actions)
         prepared, self._prepared_batch = self._prepared_batch, None
@@ -783,10 +798,10 @@ class TychoAgent(Agent):
                                   actor_writes_wm=self._mode_spec.actor_writes_wm,
                                   wm_variant=self._mode_spec.wm_variant)})
         # let the model make a couple of tool calls to write the summary, then continue
-        for _ in range(3):
+        for _ in range(self.scribe_max_calls):
             if self.calls >= self.max_calls:
                 break
-            reply = self._chat("level_summary")
+            reply = self._chat("level_summary", max_tokens=self.scribe_max_tokens or None)
             self.calls += 1
             self._note_llm_reply(reply)
             calls = reply.get("tool_calls") or []
@@ -920,14 +935,16 @@ class TychoAgent(Agent):
         hist = self.history if history is None else history
         if not getattr(getattr(self, "_ctx_cfg", None), "prompt_caching", True):
             return -1
-        if getattr(self, "context_mode", "tail_evict") != "tail_evict":
+        mode = getattr(self, "context_mode", "tail_evict")
+        if mode not in ("tail_evict", "drain"):
             return -1
         every = int(getattr(getattr(self, "_ctx_cfg", None), "cache_rolling_every", 1) or 0)
         if every <= 0 or len(hist) < 2:
             return -1
 
         stable_upto = len(hist) - 2  # keep the newest request delta outside the rolling breakpoint
-        first_mutable = self._first_cache_mutable_message_index(hist)
+        # drain never edits a kept message, so nothing before the newest delta is mutable
+        first_mutable = None if mode == "drain" else self._first_cache_mutable_message_index(hist)
         if first_mutable is not None:
             stable_upto = min(stable_upto, first_mutable - 1)
         if stable_upto < 0:
@@ -1541,6 +1558,7 @@ class TychoAgent(Agent):
         if not ev:
             return []
         self._pending_game_over_event = None
+        self._level_deaths = getattr(self, "_level_deaths", 0) + 1
         lvl = int(ev.get("level", self.level))
         turn = int(ev.get("turn", self.turn_in_level))
         action = ev.get("action") or "?"
@@ -1638,6 +1656,8 @@ class TychoAgent(Agent):
 
     def _prepare_context_before_call(self, trace: list[dict]) -> None:
         """Apply the least destructive context safeguard justified by the last usage report."""
+        if self.context_mode == "drain":
+            self._drain_history(trace)
         if not self.context_emergency_compaction:
             return
         if self.context_emergency_soft_tokens <= 0:
@@ -1660,6 +1680,88 @@ class TychoAgent(Agent):
         elif self._should_emergency_compact_before_call():
             self._compact_context_for_emergency(reason, trace)
 
+    def _drain_history(self, trace: list[dict], force: bool = False) -> bool:
+        """Drain mode: drop the oldest whole frame-turns in ONE batch once the prompt is over budget.
+
+        Franzen's harness (M0) trims the same way: the transcript is append-only between drains, so
+        every call reuses the prefix cache; a drain invalidates it once and frees ``drain_tokens``
+        below the budget, so the next drain is many turns away. A frame-turn is a frame user message
+        plus everything up to the next one, so tool-call/result pairs are never split. The newest
+        frame-turn (the live decision) always survives. ``force`` (a context-limit error) drains
+        regardless of the last usage report, keeping only that newest turn.
+        """
+        over_tokens = self._last_prompt_tokens >= self.context_drain_budget
+        over_images = self.cache_image_cap > 0 and _image_payload_count(self.history) > self.cache_image_cap
+        if not (force or over_tokens or over_images):
+            return False
+        starts = [i for i, m in enumerate(self.history) if self._is_frame_user_message(m)]
+        if len(starts) < 2:
+            # one frame-turn holds the whole transcript (a long tool loop): shrink inside it
+            return self._shrink_live_turn(trace, force=force)
+        # Per-message token estimate (text chars / 3, images at a flat cost), scaled so the whole
+        # history matches the server's last prompt count (which also covers system + tools).
+        est = [_msg_text_len(m) / 3.0 + _DRAIN_IMAGE_TOKENS * _content_media_payload_count(
+            m.get("content") if isinstance(m.get("content"), list) else []) for m in self.history]
+        total = sum(est)
+        scale = (self._last_prompt_tokens / total) if (total > 0 and self._last_prompt_tokens > total) else 1.0
+        target = max(0.0, self.context_drain_budget - self.context_drain_tokens)
+        image_target = self.cache_image_cap // 2 if self.cache_image_cap > 0 else None
+        cut = starts[-1] if force else None
+        if cut is None:
+            prompt, images = self._last_prompt_tokens or total * scale, _image_payload_count(self.history)
+            for k in range(1, len(starts)):
+                dropped = self.history[:starts[k]]
+                prompt_k = prompt - scale * sum(est[:starts[k]])
+                images_k = images - _image_payload_count(dropped)
+                cut = starts[k]
+                if prompt_k <= target and (image_target is None or images_k <= image_target):
+                    break
+        dropped_turns = sum(1 for i in starts if i < cut)
+        kept = self.history[cut:]
+        note = (f"[context drained: the {dropped_turns} oldest frame-turn(s) of this level were removed to fit "
+                f"the context window. This is not a game event. Their frames and diffs are on disk under "
+                f"level_{self.level}/; notes/ holds what you wrote.]")
+        first = dict(kept[0])
+        first["content"] = [{"text": note}, *first["content"]]
+        self.history = [first, *kept[1:]]
+        self._last_prompt_tokens = 0
+        self.token_stats["context_drains"] = int(self.token_stats.get("context_drains", 0)) + 1
+        self.reset_reasoning_chain()
+        trace.append({"text": "context drained", "dropped_turns": dropped_turns, "kept_messages": len(self.history),
+                      "force": force, "over_tokens": over_tokens, "over_images": over_images})
+        kept_tokens = scale * sum(_msg_text_len(m) / 3.0 for m in self.history)
+        if force or kept_tokens > self.context_drain_budget:
+            self._shrink_live_turn(trace, force=force)
+        return True
+
+    def _shrink_live_turn(self, trace: list[dict], *, force: bool = False, keep_steps: int = 4) -> bool:
+        """Drain mode, when the live frame-turn alone is too big: keep its frame message and its last
+        ``keep_steps`` tool steps (each an assistant message with whatever follows it up to the next
+        assistant message, so tool calls and their results stay paired) and drop the steps between.
+        Always shrinks or returns False, unlike emergency compaction, whose rescue suffix can be the
+        whole transcript (51 messages became 52 in the contract probe)."""
+        starts = [i for i, m in enumerate(self.history) if self._is_frame_user_message(m)]
+        if not starts:
+            return False
+        f = starts[-1]
+        tail = self.history[f + 1:]
+        steps = [i for i, m in enumerate(tail) if m.get("role") == "assistant"]
+        keep = 1 if force else keep_steps
+        if len(steps) <= keep:
+            return False
+        cut = steps[-keep]
+        note = (f"[context drained: {len(steps) - keep} earlier tool step(s) of this turn were removed to fit "
+                "the context window; their outputs are not repeated here. Re-run a probe if you need one.]")
+        frame = dict(self.history[f])
+        frame["content"] = [{"text": note}, *frame["content"]]
+        self.history = [*self.history[:f], frame, *tail[cut:]]
+        self._last_prompt_tokens = 0
+        self.token_stats["context_drains"] = int(self.token_stats.get("context_drains", 0)) + 1
+        self.reset_reasoning_chain()
+        trace.append({"text": "live turn shrunk", "dropped_steps": len(steps) - keep,
+                      "kept_messages": len(self.history), "force": force})
+        return True
+
     @staticmethod
     def _is_context_limit_error(e: Exception) -> bool:
         return is_context_limit_error(e)
@@ -1667,6 +1769,8 @@ class TychoAgent(Agent):
     def _recover_from_context_error(self, e: Exception, trace: list[dict]) -> bool:
         if not self.context_emergency_compaction or not self._is_context_limit_error(e):
             return False
+        if self.context_mode == "drain" and self._drain_history(trace, force=True):
+            return True
         if (
             self._reasoning_continuity
             and self._prev_response_id is not None
@@ -1885,7 +1989,16 @@ class TychoAgent(Agent):
             results = []
             for c in calls:
                 cn = canonical(c["name"])
-                if cn == "take_action":
+                if cn == "take_action" and self.strict_receipts and c is not act_call:
+                    # Only the first take_action of a reply runs. Saying "committed" for the others
+                    # made the model believe moves were played that never happened.
+                    results.append({"id": c["id"], "name": c["name"], "output": (
+                        "NOT executed: only the first take_action in a reply runs. To play several "
+                        "moves, pass them as one take_action actions=[...] sequence."
+                        if self.batch_max > 0 else
+                        "NOT executed: only the first take_action in a reply runs; commit one action per turn.")})
+                    trace.append({"tool": "take_action", "args": c.get("input", {}), "skipped": "extra_take_action"})
+                elif cn == "take_action":
                     if invalid_action_msg:
                         out = invalid_action_msg
                     elif builder_in_batch:
@@ -2258,6 +2371,79 @@ class TychoAgent(Agent):
             parts = parts[1:]
         return bool(parts and parts[0].replace("\\", "/").split("/")[-1] == "plan.py")
 
+    def _reset_level_counters(self) -> None:
+        """Per-level state of the stuck gate and the builder cap (TYCHO_BUILDER_*)."""
+        self._level_tokens_out_start = int(self.token_stats.get("tokens_out", 0))
+        self._level_builder_tokens_out = 0
+        self._level_builder_runs = 0
+        self._level_auto_builder_fires = 0
+        self._level_deaths = 0
+
+    def _level_actor_tokens_out(self) -> int:
+        """Tokens the actor generated on this level (builder output excluded, so a build cannot
+        bring the next automatic one forward)."""
+        return (int(self.token_stats.get("tokens_out", 0)) - getattr(self, "_level_tokens_out_start", 0)
+                - getattr(self, "_level_builder_tokens_out", 0))
+
+    def _stuck_builder_due(self) -> bool:
+        """TYCHO_BUILDER_GATE=stuck: fire the builder once the level has cost another
+        builder_stuck_tokens actor tokens, or another builder_stuck_deaths GAME_OVERs, since the last
+        automatic run. On M0 a level not solved within ~60K tokens is solved only 30-40% of the time and
+        the model keeps defending its first theory of the rules; a builder in a fresh context re-derives
+        them from the recorded transitions instead of from the actor's transcript."""
+        if self.builder_gate != "stuck" or self.builder is None or self.turn_in_level == 0:
+            return False
+        if self.calls >= self.max_calls:
+            return False
+        if self.builder_max_per_level and getattr(self, "_level_builder_runs", 0) >= self.builder_max_per_level:
+            return False
+        k = getattr(self, "_level_auto_builder_fires", 0) + 1
+        if self.builder_stuck_tokens > 0 and self._level_actor_tokens_out() >= self.builder_stuck_tokens * k:
+            return True
+        return self.builder_stuck_deaths > 0 and getattr(self, "_level_deaths", 0) >= self.builder_stuck_deaths * k
+
+    def _run_stuck_builder(self) -> None:
+        self._level_auto_builder_fires = getattr(self, "_level_auto_builder_fires", 0) + 1
+        tokens_k = self._level_actor_tokens_out() // 1000
+        reason = (
+            f"[automatic: level {self.level} is stuck — {tokens_k}K actor tokens and "
+            f"{getattr(self, '_level_deaths', 0)} GAME_OVER(s) on it without completing it.] Take a fresh "
+            "look. Re-derive the mechanics from the recorded transitions, not from the actor's beliefs, "
+            "and above all test the WIN CONDITION: does outcome() agree with every observed frame "
+            "(no level_complete before the level ended)? Name one experiment that would tell the actor's "
+            "current theory apart from the most plausible alternative, and put it in your report.")
+        report = self._invoke_builder(reason, reserve_calls=1)
+        self.history.append({"role": "user", "content":
+            "[auto world-model builder fired — advisory, you decide the action]\n" + report})
+
+    def _wm_status_line(self) -> str | None:
+        """TYCHO_WM_STATUS_LINE: one line of exact-replay verification for the newest frame message.
+        One sandboxed probe per turn (CPU only, no tokens); the line sits in the new message, so the
+        cached prefix is untouched."""
+        if not self.wm_status_line or self._mode_spec.wm_variant == "none" or self.turn_in_level == 0:
+            return None
+        if getattr(self, "exec", None) is None or getattr(self, "ws", None) is None:
+            return None
+        from tycho.agent.builder import _SEED_MARKER
+        if _SEED_MARKER in self.ws.read_file("world_model.py", max_bytes=200000):
+            return None  # still the seed: "reproduces 0/N" every turn would be noise
+        from tycho.agent.wm_signal import wm_signal
+        try:
+            sig = wm_signal(self.exec)
+        except Exception:  # noqa: BLE001 — a probe failure must never cost the turn
+            return None
+        stats = sig.get("stats")
+        if stats is None:
+            return None
+        matched, evaluated, first = stats
+        line = f"[world model] reproduces {matched}/{evaluated} observed changing transitions exactly"
+        if first:
+            line += f"; first divergence: {first}"
+        outcome = sig.get("outcome_divergence")
+        if outcome:
+            line += f"; outcome() check: {outcome}"
+        return line + "."
+
     def _invoke_builder(self, reason: str, *, reserve_calls: int = 0) -> str:
         """Orchestrator mode: run the world-model builder subagent (it builds/refines
         world_model.py and returns a compact advisory report). The builder's LLM passes count
@@ -2265,6 +2451,13 @@ class TychoAgent(Agent):
         analysis. Returns advisory report text; the actor still decides what to do."""
         if self.builder is None:
             return "(invoke_builder unavailable — not in orchestrator mode)"
+        runs = getattr(self, "_level_builder_runs", 0)
+        cap = getattr(self, "builder_max_per_level", 0)
+        if cap and runs >= cap:
+            return (f"World-model builder skipped: it already ran {runs} time(s) on this level (cap "
+                    f"{cap}). Its latest report is in notes/world_model_report.md; "
+                    "continue from it and the current world_model.py.")
+        self._level_builder_runs = runs + 1
         remaining = self.max_calls - self.calls - max(0, reserve_calls)
         if remaining <= 0:
             return ("World-model builder skipped: no LLM-call budget remains after reserving "
@@ -2280,7 +2473,10 @@ class TychoAgent(Agent):
         finally:
             self.calls += self.builder.calls  # account builder passes against the game ceiling
             self.builder.calls = 0
-            self._merge_token_usage(self.builder.take_token_stats())
+            _bstats = self.builder.take_token_stats()
+            self._level_builder_tokens_out = (getattr(self, "_level_builder_tokens_out", 0)
+                                              + int(_bstats.get("tokens_out", 0)))
+            self._merge_token_usage(_bstats)
         self._last_builder_trace = btrace
         # Record this builder run with its trigger reason, tool trace, and report.
         self._turn_builder_runs.append({"reason": reason, "report": report, "trace": btrace})
@@ -2374,7 +2570,11 @@ class TychoAgent(Agent):
                 level=self.level,
                 turn=self.turn_in_level,
                 available=avail,
+                batch_max=self.batch_max if self.plan_batch_hint else 0,
             )
+            status = self._wm_status_line()
+            if status:
+                plan_hint = f"{status}\n\n{plan_hint}" if plan_hint else status
         # Assemble from actor.frame.j2 — the grid/diff/no-op/vision conditionals are {% if %} blocks
         # in the template now (were inline string-building here). turn-0 intro is handled in-template.
         return render_prompt(
@@ -2511,6 +2711,10 @@ class TychoAgent(Agent):
         # Provider reasoning payloads are not prefix-cache-stable and dominate long contexts. Evict
         # Anthropic raw_reasoning and GPT reasoning_items on the same policy in every context mode.
         self._truncate_old_reasoning()
+
+
+# drain-mode estimate of one image's prompt cost (a 640 px board is ~400 visual tokens on Qwen3.8)
+_DRAIN_IMAGE_TOKENS = 400
 
 
 def _interior_changed(prev, cur, border: int) -> bool:

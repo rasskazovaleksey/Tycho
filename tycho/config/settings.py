@@ -65,6 +65,16 @@ class TychoSettings:
     batch_max: int               # most actions one take_action may commit
     batch_noop_guard_from_level: int  # 0-based level from which a no-op action stops a batch
     batch_border: int            # outer cells ignored by the batch no-op guard
+    strict_receipts: bool        # a 2nd take_action in one reply is answered "NOT executed", not "committed"
+    scribe_max_calls: int        # LLM calls the level-boundary summary may make
+    scribe_max_tokens: int       # output cap per summary call (0 = max_tokens)
+    builder_gate: str            # "" (upstream) | "stuck": also auto-fire the builder on a stuck level
+    builder_stuck_tokens: int    # stuck = this many generated tokens on the level per auto-fire so far + 1
+    builder_stuck_deaths: int    # ... or this many GAME_OVERs on the level per auto-fire so far + 1
+    builder_max_per_level: int   # builder runs per level, actor-pulled or automatic (0 = unlimited)
+    builder_max_tokens: int      # output cap per builder call (0 = max_tokens)
+    wm_status_line: bool         # one verify line on every frame message while a world model exists
+    plan_batch_hint: bool        # the plan hint offers the remaining validated plan as one sequence
 
     # ---- derived (not env): the two text-grid toggles _frame_message reads ----
     @property
@@ -118,6 +128,16 @@ class TychoSettings:
             batch_max=_envint("TYCHO_BATCH_MAX", 24),
             batch_noop_guard_from_level=_envint("TYCHO_BATCH_NOOP_GUARD_FROM_LEVEL", 1),
             batch_border=_envint("TYCHO_BATCH_BORDER", 4),
+            strict_receipts=_envbool("TYCHO_STRICT_RECEIPTS"),
+            scribe_max_calls=_envint("TYCHO_SCRIBE_MAX_CALLS", 3),
+            scribe_max_tokens=_envint("TYCHO_SCRIBE_MAX_TOKENS", 0),
+            builder_gate=os.environ.get("TYCHO_BUILDER_GATE", "").lower(),
+            builder_stuck_tokens=_envint("TYCHO_BUILDER_STUCK_TOKENS", 40000),
+            builder_stuck_deaths=_envint("TYCHO_BUILDER_STUCK_DEATHS", 2),
+            builder_max_per_level=_envint("TYCHO_BUILDER_MAX_PER_LEVEL", 0),
+            builder_max_tokens=_envint("TYCHO_BUILDER_MAX_TOKENS", 0),
+            wm_status_line=_envbool("TYCHO_WM_STATUS_LINE"),
+            plan_batch_hint=_envbool("TYCHO_PLAN_BATCH_HINT"),
         )
         s._validate()
         return s
@@ -129,6 +149,8 @@ class TychoSettings:
         for f in ("max_inference_cost_per_game", "max_inference_cost_per_level"):
             if getattr(self, f) < 0:
                 raise ValueError(f"TychoSettings.{f} must be >= 0, got {getattr(self, f)}")
+        if self.builder_gate not in ("", "stuck"):
+            raise ValueError(f"TYCHO_BUILDER_GATE={self.builder_gate!r} not in '' | stuck")
         if self.max_tool_steps < 1:
             raise ValueError(f"max_tool_steps must be >= 1, got {self.max_tool_steps}")
         if self.animation_summary_max_per_level < 0:

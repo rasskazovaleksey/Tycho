@@ -591,7 +591,7 @@ class GameWorkspace:
         p.write_text(content)
         return f"wrote {len(content)} bytes to {path}"
 
-    def validated_plan_hint(self, grid, *, level: int, turn: int, available=()) -> str | None:
+    def validated_plan_hint(self, grid, *, level: int, turn: int, available=(), batch_max: int = 0) -> str | None:
         """Return the next canonical-plan action only while its observed trajectory still matches.
 
         plan.py writes the artifact after replaying a candidate through world_model.py. The actor
@@ -643,10 +643,19 @@ class GameWorkspace:
                 next_action = f"ACTION6(row={int(action['row'])},col={int(action['col'])})"
             else:
                 next_action = name or "?"
-            return (
+            hint = (
                 f"Validated plan continuation: observed trajectory matches {offset}/{plan_length} "
                 f"action(s); next action is {next_action}. Stop and re-plan on any later divergence."
             )
+            if batch_max > 1 and plan_length - offset > 1:
+                # TYCHO_PLAN_BATCH_HINT: the rest of the plan as one take_action sequence; the batch
+                # guard stops it at the first frame that leaves the validated trajectory.
+                rest = [{k: (int(v) if k in ("row", "col") else str(v)) for k, v in a.items()
+                         if k in ("action", "row", "col") and v is not None}
+                        for a in actions[offset:offset + batch_max]]
+                hint += (f" To play the next {len(rest)} validated action(s) in one commit (it stops "
+                         f"by itself on divergence): take_action with actions={json.dumps(rest)}")
+            return hint
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
