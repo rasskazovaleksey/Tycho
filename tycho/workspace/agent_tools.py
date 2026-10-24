@@ -189,6 +189,84 @@ _RUN_PYTHON_NO_WM_DESCRIPTION = (
     "prefer the default for ordinary inspection. Pass the Python source as `code`."
 )
 
+# TYCHO_PY_HELPERS: a workspace module imported into every run_python call (see ToolExecutor).
+HELPERS_FILE = "helpers.py"
+HELPERS_SEED = '''"""helpers.py: your reusable Python. Every run_python call imports this module first, so a function
+defined here is available in every later call, on every level of this game. As soon as you would paste a
+function into a second run_python call, add it here instead (edit_file / write_file). Keep this file to
+imports and definitions: top-level code runs on every call. Its names never replace the preloaded
+`grid`, `frames`, `transitions`, `np` and `wmlib`."""
+import numpy as np
+
+
+def show(g, r0=0, r1=None, c0=0, c1=None):
+    """Print g[r0:r1, c0:c1] one hex digit per cell (colors 0-f), with row numbers and a column ruler."""
+    sub = np.asarray(g)[r0:r1, c0:c1]
+    cols = range(c0, c0 + sub.shape[1])
+    print("     " + "".join(str(c // 10 % 10) for c in cols))
+    print("     " + "".join(str(c % 10) for c in cols))
+    for i, row in enumerate(sub):
+        print(f"{r0 + i:>3}  " + "".join("%x" % int(v) for v in row))
+'''
+_HELPERS_IMPORT = (
+    "try:\n"
+    "    import helpers as _helpers\n"
+    "    globals().update({_k: _v for _k, _v in vars(_helpers).items() if not _k.startswith('_')\n"
+    "                      and _k not in ('grid', 'frames', 'transitions', 'np', 'wmlib')})\n"
+    "except Exception as _e:\n"
+    "    print(f'[helpers.py failed to import ({type(_e).__name__}: {_e}); fix it with edit_file/write_file]')\n"
+)
+# TYCHO_PY_RETAIN: top-level functions (and imports) from successful run_python calls, re-executed into every
+# later call's globals, so they see the current `grid`, `np` and `wmlib` (Franzen's ARC3_PERSISTENT_FUNCTIONS).
+RETAINED_FILE = "_retained_functions.py"
+_RETAINED_EXEC = (
+    "try:\n"
+    f"    exec(compile(open({RETAINED_FILE!r}).read(), {RETAINED_FILE!r}, 'exec'), globals())\n"
+    "except FileNotFoundError:\n"
+    "    pass\n"
+    "except Exception as _e:\n"
+    "    print(f'[kept functions failed to load ({type(_e).__name__}: {_e}); redefine them]')\n"
+)
+_PRELOADED = frozenset(("grid", "frames", "transitions", "np", "wmlib", "action", "ActionStopped", "show"))
+_RETAIN_DESCRIPTION = (
+    " Top-level functions you define (a plain def, no decorators) are KEPT automatically: later run_python "
+    "calls, on every level, can call them without defining them again; define one again to change it. "
+    "Top-level imports are kept too, variables are not, so pass snippet-specific data as arguments."
+)
+_OBJECT_DIFF_DESCRIPTION = (
+    " `wmlib.frame_diff(before, after)` (default: the last two frames) returns object-level changes between "
+    "two grids: moved (with direction and rotation), changed_color, resized, appeared, disappeared; "
+    "`wmlib.frame_diff_text(d)` prints them compactly."
+)
+
+_HELPERS_SENTENCE = re.compile(r"You may create reusable Python (?:analysis )?helper modules with write_file and "
+                               r"import them in later calls\.")
+_HELPERS_DESCRIPTION = ("helpers.py (workspace root) is imported into EVERY run_python call: a function you will "
+                        "use again belongs there (edit_file/write_file), not re-defined in each call; it persists "
+                        "across levels. It starts with show(g, r0, r1, c0, c1), a labeled hex view of a region.")
+
+
+_PY_ACTIONS_DESCRIPTION = (
+    " You can also PLAY from run_python: `obs = action(\"ACTION1\")` or `action(\"ACTION6\", row=r, col=c)` "
+    "plays one game action, waits for the game, updates `grid` and returns `obs`, a dict with `grid`, "
+    "`state`, `levels_completed`, `changed` (a summary of what changed on the board) and `available`. The "
+    "script keeps running between actions, so one call can probe several actions and react to what they "
+    "do, e.g. `for a in (\"ACTION1\", \"ACTION2\"): print(a, action(a)[\"changed\"])`, or walk a computed "
+    "path and re-plan when a step does not do what you expected. Every action is scored like take_action. "
+    "Once a script has played an action your turn ends; the script goes on until its code finishes, the "
+    "level completes, the game ends or it has played {max} actions (then action() raises ActionStopped). "
+    "What it printed, and the actions it played, are shown with the frame after it ends. Use the returned "
+    "`obs`/`grid` inside the script, not files: frames are recorded after the script."
+)
+
+
+def _with_helpers(desc: str) -> str:
+    out, n = _HELPERS_SENTENCE.subn(_HELPERS_DESCRIPTION, desc)
+    if n != 1:
+        raise RuntimeError("run_python description changed; update agent_tools._HELPERS_SENTENCE")
+    return out
+
+
 _SCHEMAS = {
     "ls": {"type": "object", "properties": {"path": {"type": "string"}}},
     "read_file": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
@@ -238,13 +316,20 @@ def tool_specs(flavor: str = "generic", include_builder: bool = False,
                include_edit_func: bool = False, world_model_enabled: bool = True,
                include_take_action: bool = True,
                include_set_verbosity: bool = True,
-               batch_max: int = 0) -> list[dict]:
+               batch_max: int = 0,
+               py_helpers: bool = False,
+               py_actions_max: int = 0,
+               py_retain: bool = False,
+               object_diff: bool = False) -> list[dict]:
     """Build a model-flavored tool surface.
 
     ``include_builder`` adds the actor-only builder handoff, ``include_edit_func`` adds the
     function-granular Python editor, and ``include_set_verbosity`` controls the actor's persistent
     frame-display setting. Builders use the editor but omit verbosity and environment actions.
     ``batch_max > 0`` lets take_action commit a sequence of up to that many actions.
+    ``py_helpers`` describes the auto-imported helpers.py in run_python (TYCHO_PY_HELPERS);
+    ``py_actions_max > 0`` describes action(...) inside run_python (TYCHO_PY_ACTIONS, actor only);
+    ``py_retain`` the kept functions (TYCHO_PY_RETAIN); ``object_diff`` wmlib.frame_diff (TYCHO_OBJECT_DIFF).
     """
     names = _FLAVOR_NAMES.get(flavor, _FLAVOR_NAMES["generic"])
     order = [c for c in _ORDER if include_take_action or c != "take_action"]
@@ -259,6 +344,14 @@ def tool_specs(flavor: str = "generic", include_builder: bool = False,
     out = []
     for c in order:
         desc = _RUN_PYTHON_NO_WM_DESCRIPTION if (c == "run_python" and not world_model_enabled) else _DESCRIPTIONS[c]
+        if c == "run_python" and py_helpers:
+            desc = _with_helpers(desc)
+        if c == "run_python" and py_retain:
+            desc = desc + _RETAIN_DESCRIPTION
+        if c == "run_python" and object_diff:
+            desc = desc + _OBJECT_DIFF_DESCRIPTION
+        if c == "run_python" and py_actions_max > 0:
+            desc = desc + _PY_ACTIONS_DESCRIPTION.replace("{max}", str(py_actions_max))
         schema = _SCHEMAS[c]
         if c == "take_action" and batch_max > 0:
             desc = _TAKE_ACTION_BATCH_DESCRIPTION.replace("{batch_max}", str(batch_max))
@@ -282,12 +375,68 @@ class ToolExecutor:
         workspace,
         wm_feedback_enabled: bool = True,
         python_sandbox: PythonSandbox | None = None,
+        py_helpers: bool = False,
+        py_retain: bool = False,
     ):
         self.ws = workspace
         self.wm_feedback_enabled = wm_feedback_enabled
         self._python_sandbox = python_sandbox
         self.cur_grid = None  # kept for back-compat (agent sets it); no longer used by a tool
         self.available = []   # the agent sets this each turn (for world-model auto-feedback)
+        # TYCHO_PY_HELPERS: every run_python call imports the workspace's helpers.py, so a function
+        # written once persists across calls and levels (DeepSeek-V4 re-defined the same helpers up
+        # to 27 times per game, each run_python being a fresh process).
+        self.py_helpers = py_helpers
+        if py_helpers and not (Path(self.ws.dir) / HELPERS_FILE).exists():
+            self.ws.write_file(HELPERS_FILE, HELPERS_SEED)
+        self.py_retain = py_retain
+        self._retained: dict[str, str] = {}      # function name -> source (insertion order = definition order)
+        self._retained_imports: list[str] = []
+
+    def _preamble(self) -> str:
+        return (self._PREAMBLE + (_HELPERS_IMPORT if self.py_helpers else "")
+                + (_RETAINED_EXEC if self.py_retain else ""))
+
+    def retain(self, code: str) -> list[str]:
+        """TYCHO_PY_RETAIN: keep the top-level functions and imports of ``code`` (a call that ran cleanly).
+        Returns the names kept. The file only ever holds definitions that compile together."""
+        if not self.py_retain:
+            return []
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return []
+        defs, imports = {}, []
+        for node in tree.body:
+            src = ast.get_source_segment(code, node)
+            if not src:
+                continue
+            if isinstance(node, ast.FunctionDef) and not node.decorator_list and node.name not in _PRELOADED:
+                defs[node.name] = src
+            elif isinstance(node, (ast.Import, ast.ImportFrom)) and src not in self._retained_imports:
+                imports.append(src)
+        if not defs:
+            return []
+        retained = {**self._retained, **defs}
+        kept_imports = self._retained_imports + imports
+        text = "\n".join(kept_imports) + "\n\n\n" + "\n\n\n".join(retained.values()) + "\n"
+        try:
+            compile(text, RETAINED_FILE, "exec")
+        except SyntaxError:
+            return []
+        self._retained, self._retained_imports = retained, kept_imports
+        (Path(self.ws.dir) / RETAINED_FILE).write_text(text)
+        return list(defs)
+
+    def retained_signatures(self) -> list[str]:
+        out = []
+        for name, src in self._retained.items():
+            try:
+                fn = ast.parse(src).body[0]
+                out.append(f"{name}({ast.unparse(fn.args)})")
+            except (SyntaxError, IndexError, AttributeError):
+                out.append(f"{name}(...)")
+        return out
 
     def execute(self, name: str, args: dict) -> str:
         """Execute one tool and keep host filesystem locations out of model-visible output."""
@@ -416,6 +565,16 @@ class ToolExecutor:
                     f"runpy.run_path({script!r}, run_name='__main__')\n")
         return code
 
+    def start_script(self, code: str):
+        """A run_python script that may call action(...) (TYCHO_PY_ACTIONS), as a live ScriptSession."""
+        from tycho.workspace.script_session import ScriptSession
+
+        if self._python_sandbox is None:
+            self._python_sandbox = PythonSandbox()
+        session = ScriptSession.start(self._python_sandbox, self.ws.dir, self._preamble(), self._shellish_to_python(code))
+        session.code = code
+        return session
+
     def _run_python(self, code: str, timeout: int = 15) -> str:
         if not code.strip():
             return "(no code)"
@@ -424,9 +583,11 @@ class ToolExecutor:
             self._python_sandbox = PythonSandbox()
         result = self._python_sandbox.run_source(
             self.ws.dir,
-            self._PREAMBLE + code,
+            self._preamble() + code,
             timeout=timeout,
         )
+        if self.py_retain and not result.timed_out and not result.returncode:
+            self.retain(code)
         if result.timed_out:
             parts = [
                 f"(run_python did not finish within {timeout}s; no conclusion about model correctness)"

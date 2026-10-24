@@ -1,0 +1,18 @@
+{#- Stuck critic request. Context: level, tokens_k, deaths, resets, actions (offered now), notes (inlined
+    notes or ""), log (the level's attempts as action/change lines). The current board image follows. -#}
+The agent has spent {{ tokens_k }}K tokens, {{ deaths }} GAME_OVER(s) and {{ resets }} RESET(s) on level {{ level }} without completing it. Actions it can take: {{ actions | join(', ') }}.
+
+{% if notes %}
+The agent's notes:
+{{ notes }}
+
+{% endif %}
+Observed log of this level (each line: the action, then what changed):
+{{ log }}
+
+The current board is attached. Reply with:
+1. Overlooked: the observed changes (with turn numbers) that the notes ignore, dismiss or explain inconsistently, and the actions or objects never tried.
+2. Three different hypotheses about the goal, and the mechanic it depends on, that fit ALL the observations, the overlooked ones included. For each, what the board would look like when the goal is reached.
+3. For each hypothesis, the cheapest probe (a few actions) that would confirm or rule it out, and what each outcome would show.
+4. Which probe to run first, and why.
+Keep it under 400 words.

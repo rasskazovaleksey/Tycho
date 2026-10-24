@@ -124,6 +124,65 @@ def diff_text(prev, cur) -> str:
     return f"{len(d)} cells changed; region [{bbox}]\n" + "\n".join(lines)
 
 
+def _components(grid) -> list[tuple[int, int, int, int, int, tuple]]:
+    """4-connected same-color components, background (the most common color) excluded:
+    (color, r0, c0, h, w, mask) where mask is the component's cells relative to its bbox."""
+    from collections import Counter
+
+    g = [list(map(int, r)) for r in grid]
+    H, W = len(g), len(g[0]) if g else 0
+    bg = Counter(v for row in g for v in row).most_common(1)[0][0] if H else 0
+    seen = [[False] * W for _ in range(H)]
+    out = []
+    for r in range(H):
+        for c in range(W):
+            if seen[r][c] or g[r][c] == bg:
+                continue
+            color, stack, cells = g[r][c], [(r, c)], []
+            seen[r][c] = True
+            while stack:
+                y, x = stack.pop()
+                cells.append((y, x))
+                for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                    if 0 <= ny < H and 0 <= nx < W and not seen[ny][nx] and g[ny][nx] == color:
+                        seen[ny][nx] = True
+                        stack.append((ny, nx))
+            r0, c0 = min(y for y, _ in cells), min(x for _, x in cells)
+            h, w = max(y for y, _ in cells) - r0 + 1, max(x for _, x in cells) - c0 + 1
+            out.append((color, r0, c0, h, w, tuple(sorted((y - r0, x - c0) for y, x in cells))))
+    return out
+
+
+def board_novelty(prev, cur, max_lines: int = 8, small: int = 100) -> list[str]:
+    """What a new level's first board has that the previous level's first board did not, most telling
+    first: colors that appear or vanish, then small objects (at most ``small`` cells and 12x12, where pieces,
+    keys and glyphs live) of a shape not seen before, then changed object counts per color. Large regions
+    (walls, floors, panels) are skipped: they change with the layout. Observations only, no game semantics."""
+    before, after = _components(prev), _components(cur)
+    is_small = lambda comp: 1 < len(comp[5]) <= small and comp[3] <= 12 and comp[4] <= 12  # noqa: E731
+    count_before, count_after = {}, {}
+    for comp in before:
+        count_before[comp[0]] = count_before.get(comp[0], 0) + 1
+    for comp in after:
+        count_after[comp[0]] = count_after.get(comp[0], 0) + 1
+    where = lambda comp: f"{comp[3]}x{comp[4]} at rows {comp[1]}-{comp[1] + comp[3] - 1}, cols {comp[2]}-{comp[2] + comp[4] - 1}"  # noqa: E731
+    new_colors = sorted(set(count_after) - set(count_before))
+    lines = [f"color {color}: new on this board, {count_after[color]} object(s), e.g. "
+             f"{where(next(comp for comp in after if comp[0] == color))}" for color in new_colors]
+    lines += [f"color {color}: gone ({count_before[color]} object(s) on the previous board)"
+              for color in sorted(set(count_before) - set(count_after))]
+    shapes_before = {(comp[0], comp[5]) for comp in before}
+    for comp in after:
+        if is_small(comp) and comp[0] not in new_colors and (comp[0], comp[5]) not in shapes_before:
+            lines.append(f"new small shape: color {comp[0]}, {where(comp)}")
+            shapes_before.add((comp[0], comp[5]))
+    lines += [f"color {color}: {count_after[color]} object(s), was {count_before[color]}"
+              for color in sorted(count_after) if color in count_before and count_after[color] != count_before[color]]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [f"... and {len(lines) - max_lines} more differences"]
+    return lines
+
+
 def _parse_grid_text(text: str) -> list[list[int]]:
     """Parse any grid_text() format currently written to turn_*.txt."""
     s = text.strip()
@@ -590,6 +649,88 @@ class GameWorkspace:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
         return f"wrote {len(content)} bytes to {path}"
+
+    def level_grid(self, level: int, turn: int = 0):
+        """The recorded grid of ``level`` at ``turn`` of its current attempt, or None."""
+        p = self._ldir(level) / f"turn_{turn:03d}.txt"
+        return _parse_grid_text(p.read_text()) if p.is_file() else None
+
+    def level_action_log(self, level: int, max_chars: int = 7000, ld=None) -> str:
+        """The level's current attempt (or the attempt directory ``ld``) as one line per action: what was
+        done and what changed (the first line of each diff plus up to three change lines), ending with the
+        winning action and the change it caused. Over ``max_chars`` the middle turns are elided."""
+        archived = ld is not None
+        ld = Path(ld) if archived else self._ldir(level)
+        metas = sorted(ld.glob("turn_*.json"))
+        lines = []
+        for meta_path in metas[1:]:
+            meta = json.loads(meta_path.read_text())
+            t = meta.get("turn", 0)
+            act = meta.get("action") or "?"
+            if meta.get("row") is not None:
+                act += f"(row {meta['row']}, col {meta['col']})"
+            diff_path = ld / f"diff_{t - 1:03d}_{t:03d}.txt"
+            change = diff_path.read_text().strip().splitlines() if diff_path.is_file() else ["(no diff recorded)"]
+            detail = "; ".join(s.strip() for s in change[1:4]) + (" ..." if len(change) > 4 else "")
+            lines.append(f"turn {t}: {act} -> {change[0]}" + (f" | {detail}" if detail else ""))
+        solved = ld / "solved.json"
+        terminal = ld / "terminal.json"
+        if solved.is_file():
+            win = json.loads(solved.read_text())
+            act = win.get("action") or "?"
+            if win.get("row") is not None:
+                act += f"(row {win['row']}, col {win['col']})"
+            change = "level complete"
+            if terminal.is_file() and metas:
+                pre = _parse_grid_text((ld / metas[-1].name.replace(".json", ".txt")).read_text())
+                post = json.loads(terminal.read_text()).get("terminal_grid")
+                if pre and post:
+                    diff = diff_text(pre, post).splitlines()
+                    change += f"; terminal frame vs last frame: {diff[0]}" + (
+                        " | " + "; ".join(s.strip() for s in diff[1:4]) if len(diff) > 1 else "")
+            lines.append(f"winning action: {act} -> {change}")
+        attempts = [] if archived else sorted((self.dir / "attempts").glob(f"level_{level}_attempt_*"))
+        head = (f"{len(attempts)} earlier attempt(s) of this level ended in RESET or GAME_OVER (archived under "
+                f"attempts/); this log is the {'winning' if solved.is_file() else 'current'} attempt.\n"
+                if attempts else "")
+        text = "\n".join(lines)
+        if len(text) > max_chars:
+            keep_head, keep = lines[:12], []
+            for line in reversed(lines[12:]):
+                if sum(len(x) + 1 for x in keep_head + keep) + len(line) > max_chars - 80:
+                    break
+                keep.insert(0, line)
+            text = "\n".join(keep_head + [f"... {len(lines) - len(keep_head) - len(keep)} turns omitted ..."] + keep)
+        return head + (text or "(no actions recorded)")
+
+    def attempt_logs(self, level: int, max_chars: int = 9000, earlier: int = 2) -> str:
+        """Action logs of the last ``earlier`` archived attempts of ``level`` and of the current one."""
+        attempts = sorted((self.dir / "attempts").glob(f"level_{level}_attempt_*"))[-earlier:]
+        share = max_chars // (len(attempts) + 1)
+        parts = [f"Earlier attempt {a.name.rsplit('_', 1)[-1]} (ended in RESET or GAME_OVER):\n"
+                 + self.level_action_log(level, share, ld=a / f"level_{level}") for a in attempts]
+        parts.append("Current attempt:\n" + self.level_action_log(level, share))
+        return "\n\n".join(parts)
+
+    def notes_digest(self, paths: list[str], max_bytes_each: int = 4000) -> str:
+        """The files in ``paths`` that exist, each under a ``### <path>`` heading and capped at
+        ``max_bytes_each``, for inlining into a prompt in place of an instruction to read them.
+        A deterministic level-insight fallback keeps its header and the winning action; its raw
+        terminal grid (a 64x64 JSON dump) is replaced by a pointer to the file."""
+        parts = []
+        for path in paths:
+            p = self._resolve(path)
+            if not p.is_file():
+                continue
+            text = p.read_text(errors="replace").strip()
+            if "Deterministic fallback note" in text and "\n\nterminal.json:" in text:
+                level_dir = path.split("_insights.md")[0].replace("notes/level_", "level_")
+                text = text.split("\n\nterminal.json:")[0] + f"\n\n(terminal frame: {level_dir}/terminal.txt)"
+            if len(text) > max_bytes_each:
+                text = text[:max_bytes_each] + f"\n…(truncated; full file: {path})"
+            if text:
+                parts.append(f"### {path}\n{text}")
+        return "\n\n".join(parts)
 
     def validated_plan_hint(self, grid, *, level: int, turn: int, available=(), batch_max: int = 0) -> str | None:
         """Return the next canonical-plan action only while its observed trajectory still matches.

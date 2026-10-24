@@ -332,11 +332,24 @@ class WorldModelBuilder:
         available_actions = list(available_actions or [])
         # TYCHO_BUILDER_STARTER: a first-model recipe while world_model.py is still the seed. In the 2 h
         # Qwen run 21 of 24 orchestrator workspaces still held the seed transition() at the end.
+        wm_source = ws.read_file("world_model.py", max_bytes=200000)
         starter = (os.environ.get("TYCHO_BUILDER_STARTER", "") in ("1", "on", "true", "yes")
-                   and _SEED_MARKER in ws.read_file("world_model.py", max_bytes=200000))
+                   and _SEED_MARKER in wm_source)
+        # TYCHO_BUILDER_INLINE_NOTES: the notes the kickoff would have the builder read first are
+        # inlined, plus world_model.py once it is no longer the seed. With DeepSeek-V4 and 6 steps,
+        # 24 of 33 builder tool calls were ls/read_file (often of notes that did not exist), and no
+        # pass reached an edit of world_model.py.
+        inline_notes = None
+        if os.environ.get("TYCHO_BUILDER_INLINE_NOTES", "") in ("1", "on", "true", "yes"):
+            insights = [f"notes/level_{k}_insights.md" for k in range(max(0, level - 2), level + 1)]
+            inline_notes = ws.notes_digest(["notes/actor_beliefs.md", "notes/world_model.md", REPORT_FILE,
+                                            "notes/animation_evidence.md", *insights])
+            if _SEED_MARKER not in wm_source and not wm_source.startswith("(no such file"):
+                inline_notes += "\n\n" + ws.notes_digest(["world_model.py"], max_bytes_each=8000)
+            inline_notes = inline_notes.strip() or "(no notes written yet; world_model.py is the seed)"
         kickoff = render_prompt("builder.user", level=level, hint=hint,
                                 available_actions=available_actions, report_file=REPORT_FILE,
-                                starter=starter)
+                                starter=starter, inline_notes=inline_notes)
         # Auto-attach the current verify state up front so the builder doesn't have to spend its
         # first 2–4 tool calls running verify + diffing frames itself (it always would). When the
         # verify state names a first_divergence, ALSO attach the two PNGs (prev frame + observed

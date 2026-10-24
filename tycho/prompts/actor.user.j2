@@ -10,13 +10,23 @@
       no_op               : last action changed nothing
       last_action         : for the no-op message
       plan_hint           : guarded next action from a canonically validated plan, or None
+      carry_forward       : carry-forward notes inlined at a level start (TYCHO_LEVEL_START_INLINE),
+                            None or undefined otherwise
       turn3               : f"{turn_in_level:03d}" (the zero-padded turn, for file paths)
     Whitespace is exact-matched to the old string concat (header + "\n" + intro + grid + change +
     "\n(Also saved …)") — the equivalence test pins it. `~` is Jinja string concat. -#}
 {{ header }}
 {% if turn_in_level == 0 %}
 {% if frame_boundary == 'level_start' %}
-{% if wm_variant == 'none' %}
+{% if carry_forward is defined and carry_forward %}
+A new, likely harder level begins now — a fresh grid. Your conversation was cleared at the boundary; your carry-forward notes are inlined below, so there is no need to re-read them (the files of earlier levels stay on disk for details).
+{% if wm_variant != 'none' %}
+If you have derived a reliable world model for the game, then use it before acting. You can also check the new init frame and whether init_state() still holds.
+{% endif %}
+
+{{ carry_forward }}
+
+{% elif wm_variant == 'none' %}
 A new, likely harder level begins now — a fresh grid. Your conversation was cleared at the boundary; carry-forward is on disk. If notes/level_{{ level - 1 }}_insights.md exists, read it before acting.
 {% else %}
 A new, likely harder level begins now — a fresh grid. Your conversation was cleared at the boundary; carry-forward is on disk. If notes/level_{{ level - 1 }}_insights.md exists, read it. If you have derived a reliable world model for the game, then use it before acting. You can also check the new init frame and whether init_state() still holds.

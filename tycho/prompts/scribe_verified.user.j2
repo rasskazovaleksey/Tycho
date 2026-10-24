@@ -1,0 +1,17 @@
+{#- Verified level summary (TYCHO_SCRIBE_MODE=verified): fires on LEVEL_COMPLETE before the conversation
+    is reset. The reply TEXT is the note: the harness saves it as notes/level_<L>_insights.md and inlines it
+    at the next level's start, so the note exists in every mode whatever tools the model would call.
+    Context: level, action_log (the level's actions and observed changes, ending with the winning action),
+    actions (the actions offered on this level). -#}
+You just COMPLETED level {{ level }}. Before the next level begins, write down the rules you established, checked against what actually happened. Do not take an action and do not call tools: reply with the summary as plain text. The harness saves your reply as notes/level_{{ level }}_insights.md and shows it to you when the next level starts, after this conversation is cleared, so it is all you will remember of this level.
+
+Observed log of this level (your actions and what changed; the last line is the winning action):
+{{ action_log }}
+
+Write these sections. Describe objects by role and color, not by coordinates (coordinates only in section 5):
+1. Objects: every object or region on the board, HUD included (bars, counters, icons, panels), each with its role or "unknown".
+2. Actions: one line for each of {{ actions | join(', ') }}: its effect by object role and how many logged turns confirm it, or "untested" if you never used it.
+3. Goal: the win condition as a check that holds on the winning frame and fails on the frames before it. If the level was won by trial or sweeping rather than understanding, write "goal unverified" and your best hypothesis.
+4. Unexplained: every logged change (with its turn number) that your rules in sections 2-3 do not explain. These are the open questions to resolve next.
+5. Level details: the winning sequence and the coordinates that will not transfer to another level.
+6. Next level checklist: what to compare first on the new board, and which untested actions or unexplained objects to probe before reusing these rules.

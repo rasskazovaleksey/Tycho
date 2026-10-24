@@ -155,6 +155,10 @@ class TychoAgent(Agent):
         self.builder_max_per_level = self.settings.builder_max_per_level
         self.wm_status_line = self.settings.wm_status_line
         self.plan_batch_hint = self.settings.plan_batch_hint
+        self.level_start_inline = self.settings.level_start_inline
+        self.drain_images = self.settings.drain_images
+        self.scribe_mode = self.settings.scribe_mode
+        self.level_start_probe = self.settings.level_start_probe
         # H017 perception ablations — TYCHO_TEXT_GRID (full|diff|none) sets the STARTING grid/diff
         # toggles (show_grid/show_diff are derived properties on Settings); the agent can flip them
         # mid-game via set_verbosity. TYCHO_GRID_EMBEDS attaches the exact per-cell prompt_embeds.
@@ -230,10 +234,22 @@ class TychoAgent(Agent):
         self.batch_max = self.settings.batch_max if self.settings.batch_actions else 0
         self.batch_noop_guard_from_level = self.settings.batch_noop_guard_from_level
         self.batch_border = self.settings.batch_border
+        # TYCHO_PY_ACTIONS: run_python may call action(...) and keep playing across steps (a live script
+        # process; host sandbox only, where the script is a child of this process).
+        self.py_actions = self.settings.py_actions and os.environ.get("TYCHO_SANDBOX_RUNTIME", "") == "host"
+        if self.settings.py_actions and not self.py_actions:
+            print("[tycho] TYCHO_PY_ACTIONS needs TYCHO_SANDBOX_RUNTIME=host; acting scripts are off", flush=True)
+        self.py_actions_max = self.settings.py_actions_max
+        self.object_diff = self.settings.object_diff
+        self.stuck_critic = self.settings.stuck_critic
         self._tools_spec = tools or tool_specs(flavor, include_builder=self._orchestrator,
                                                include_edit_func=actor_edit_func,
                                                world_model_enabled=wm_prompt_enabled,
-                                               batch_max=self.batch_max)
+                                               batch_max=self.batch_max,
+                                               py_helpers=self.settings.py_helpers,
+                                               py_actions_max=self.py_actions_max if self.py_actions else 0,
+                                               py_retain=self.settings.py_retain,
+                                               object_diff=self.settings.object_diff)
         # PER-MODEL vision profile (single source of truth, vision.py): render scale + whether THIS
         # model's encoder sees the image losslessly per cell. Drives BOTH the PNG render scale and
         # the perception sentence — decoupled (lossless ⊥ text-inlined). lossless_cells is asserted
@@ -247,7 +263,9 @@ class TychoAgent(Agent):
             "actor.system", colormap=_COLORMAP, wm_variant=self._mode_spec.wm_variant,
             vision=self.vision, show_grid=self.show_grid, show_diff=self.show_diff,
             lossless_cells=_img_lossless, meta_reflect=self.settings.meta_reflect,
-            batch_actions=self.batch_max > 0, batch_max=self.batch_max)
+            batch_actions=self.batch_max > 0, batch_max=self.batch_max,
+            budget_prompt=self.settings.budget_prompt, py_actions=self.py_actions,
+            goal_hypotheses=self.settings.goal_hypotheses)
         self.animation_summary_enabled = self.settings.animation_summary and self.vision
         self.animation_summary_video_enabled = (
             self.settings.animation_summary_video and _supports_animation_video(self.cfg)
@@ -308,7 +326,8 @@ class TychoAgent(Agent):
                                 available_actions=available_actions, resume=resume,
                                 render_scale=self._vision_profile.render_scale,
                                 seed_world_model=wm_enabled)
-        self.exec = ToolExecutor(self.ws, wm_feedback_enabled=wm_enabled)
+        self.exec = ToolExecutor(self.ws, wm_feedback_enabled=wm_enabled, py_helpers=self.settings.py_helpers,
+                                 py_retain=self.settings.py_retain)
         self.history: list[dict] = []     # the one growing conversation
         self.calls = 0
         self.token_stats = {"tokens_in": 0, "tokens_out": 0, "cache_read": 0, "cache_write": 0,
@@ -338,7 +357,10 @@ class TychoAgent(Agent):
                 self.cfg, self.exec, tool_specs(self._flavor, include_builder=False,
                                                 include_edit_func=True,
                                                 include_take_action=False,
-                                                include_set_verbosity=False),
+                                                include_set_verbosity=False,
+                                                py_helpers=self.settings.py_helpers,
+                                                py_retain=self.settings.py_retain,
+                                                object_diff=self.settings.object_diff),
                 effort=self.effort, max_tokens=self.settings.builder_max_tokens or self.max_tokens)
         # trigger mode: the harness-side scheduler that fires the builder on (action committed ∧
         # world model mispredicts), rate-limited. None in single/orchestrator (additive — those
@@ -526,7 +548,16 @@ class TychoAgent(Agent):
         # fires; otherwise close the sequence and fall through to a normal turn, which reports it.
         if getattr(self, "_batch", None) is not None:
             stop = self._batch_guard(latest_frame, avail, game_avail)
-            if stop is None and self._batch["queue"]:
+            if self._batch.get("script") is not None:
+                # a run_python script that plays (TYCHO_PY_ACTIONS): its next action comes from the script
+                if stop is None:
+                    step, stop = self._script_next(latest_frame, avail, available_actions, state)
+                    if step is not None:
+                        self._batch["queue"] = [step]
+                        self._batch["labels"].append(
+                            self._action_label(step["action"], row=step.get("row"), col=step.get("col")))
+                        return self._continue_batch(latest_frame, available_actions, avail, game_avail, state)
+            elif stop is None and self._batch["queue"]:
                 return self._continue_batch(latest_frame, available_actions, avail, game_avail, state)
             self._finish_batch(stop, grid)
 
@@ -585,6 +616,10 @@ class TychoAgent(Agent):
         if batch_report is not None:
             content.append({"text": batch_report["text"]})
         content.append({"text": self._frame_message(grid, state, avail, frame_boundary)})
+        kept = self.exec.retained_signatures() if getattr(self.exec, "py_retain", False) else []
+        if kept:
+            content.append({"text": "Functions kept from your earlier run_python calls (call them directly; define one "
+                                    "again to change it): " + ", ".join(kept[-25:])})
         self._pending_frame_boundary = None
         png = self.ws.current_png(self.level, self.turn_in_level) if self.vision else None
         if png is not None:
@@ -633,10 +668,16 @@ class TychoAgent(Agent):
             self._dispatch(Event.LEVEL_START, {"level": self.level, "at_level_start": True})
         if self._stuck_builder_due():
             self._run_stuck_builder()
+        if self._stuck_critic_due():
+            self._run_stuck_critic(grid, game_avail)
         self._prepared_batch = None
+        self._prepared_script = None
         choice, trace = self._run_until_action(available_actions)
         prepared, self._prepared_batch = self._prepared_batch, None
-        if prepared is not None and choice is prepared["first"]:
+        script, self._prepared_script = self._prepared_script, None
+        if script is not None:
+            self._start_script_batch(script[0], script[1], grid, game_avail)
+        elif prepared is not None and choice is prepared["first"]:
             self._start_batch(prepared, grid, game_avail)
         self._last_tool_trace = trace
         token_delta = {
@@ -656,6 +697,8 @@ class TychoAgent(Agent):
             choice.reasoning["llm_calls"] = take_recording()
         self._last_action = choice.action.name
         self._last_committed_control = choice.action.name
+        if choice.action.name == "RESET":
+            self._level_resets = getattr(self, "_level_resets", 0) + 1
         # (Trigger-mode builder now fires at the START of the turn — see above — so the actor's
         # _run_until_action already reasoned on the corrected model. Nothing to fire here.)
         # Record this turn's builder activity: which agent ran, why it ran, and its report.
@@ -792,6 +835,8 @@ class TychoAgent(Agent):
         if self.calls >= self.max_calls:
             self._write_level_insight_fallback(self.level, "LLM-call budget exhausted before consolidation")
             return
+        if getattr(self, "scribe_mode", "tools") == "verified":
+            return self._summarize_level_verified()
         self.history.append({"role": "user",
                               "content": render_prompt(
                                   "scribe.user", level=self.level,
@@ -823,13 +868,58 @@ class TychoAgent(Agent):
             self.history.append({"role": "tool", "results": results})
         self._write_level_insight_fallback(self.level, "summary pass did not create the requested note")
 
-    def _write_level_insight_fallback(self, level: int, reason: str) -> None:
-        """Ensure level-boundary carry-forward exists if the LLM summary failed to write it."""
+    def _summarize_level_verified(self) -> None:
+        """TYCHO_SCRIBE_MODE=verified: the harness, not a tool call, writes the carry-forward note.
+
+        The model gets the level's action/effect log inline and replies with the summary as text (rule
+        table, goal check, unexplained changes, next-level checklist); the harness saves that text. With
+        the tool-driven summary, DeepSeek-V4 spent its calls reading files and verifying, and 15 of 16
+        single-mode boundaries (5 of 16 lite ones) fell back to the deterministic note."""
+        path = f"notes/level_{self.level}_insights.md"
+        log = self.ws.level_action_log(self.level)
+        self.history.append({"role": "user", "content": render_prompt(
+            "scribe_verified.user", level=self.level, action_log=log,
+            actions=list(getattr(self, "_current_game_actions", None) or []) or ["the offered actions"])})
+        text = ""
+        max_tokens = max(self.scribe_max_tokens or self.max_tokens, 8192)
+        for attempt in range(2):
+            if self.calls >= self.max_calls:
+                break
+            reply = self._chat("level_summary", max_tokens=max_tokens)
+            self.calls += 1
+            self._note_llm_reply(reply)
+            calls = reply.get("tool_calls") or []
+            self.history.append({"role": "assistant", "content": reply.get("text", ""),
+                                 "tool_calls": calls or None, "raw_reasoning": reply.get("raw_reasoning"),
+                                 "reasoning_items": reply.get("reasoning_items")})
+            if calls:
+                self.history.append({"role": "tool", "results": [
+                    {"id": c["id"], "name": c["name"], "output": "(not run: reply with the summary as plain text)"}
+                    for c in calls]})
+            text = (reply.get("text") or "").strip()
+            if len(text) >= 300:
+                break
+            self.history.append({"role": "user", "content": (
+                "Write the summary now as plain text in the six sections above. Do not call tools.")})
+        if len(text) >= 300:
+            self.ws.write_file(path, f"# Level {self.level} insights (level summary)\n\n{text}\n")
+        else:
+            self._write_level_insight_fallback(self.level, "summary pass did not produce a note",
+                                               action_log=log)
+
+    def _write_level_insight_fallback(self, level: int, reason: str, action_log: str | None = None) -> None:
+        """Ensure level-boundary carry-forward exists if the LLM summary failed to write it. An empty or
+        near-empty note (e.g. a write_file without content) counts as missing."""
         if getattr(self, "ws", None) is None:
             return
         path = f"notes/level_{level}_insights.md"
         existing = self.ws.read_file(path, max_bytes=200)
-        if not existing.startswith("(no such file"):
+        if not existing.startswith("(no such file") and len(existing.strip()) >= 40:
+            return
+        if action_log is not None:
+            self.ws.write_file(path, (
+                f"# Level {level} Insights\n\nDeterministic fallback note: {reason}. The level summary did not "
+                f"produce a note; this is the level's observed action log instead.\n\n{action_log}\n"))
             return
         solved = self.ws.read_file(f"level_{level}/solved.json", max_bytes=1000)
         terminal = self.ws.read_file(f"level_{level}/terminal.json", max_bytes=1800)
@@ -1694,6 +1784,23 @@ class TychoAgent(Agent):
         over_images = self.cache_image_cap > 0 and _image_payload_count(self.history) > self.cache_image_cap
         if not (force or over_tokens or over_images):
             return False
+        if over_images and not (force or over_tokens) and getattr(self, "drain_images", "drop") == "strip":
+            # TYCHO_DRAIN_IMAGES=strip: only the image cap is exceeded, so strip the oldest images down to
+            # image_keep and keep their turns' text, tool results and reasoning. Dropping whole turns for
+            # it (the default) drained a DeepSeek-V4 run every ~5 decisions on vLLM's 8-image limit (78 of
+            # 84 drains in 25 games), wiping the agent's working memory each time. One re-prefill per strip.
+            keep = max(1, min(self.cache_image_keep, self.cache_image_cap))
+            stripped = 0
+            for m in self.history:
+                if _image_payload_count(self.history) <= keep:
+                    break
+                if _has_media_payload(m):
+                    _strip_image(m)
+                    stripped += 1
+            self.token_stats["image_strips"] = int(self.token_stats.get("image_strips", 0)) + 1
+            trace.append({"text": "images stripped", "stripped_messages": stripped,
+                          "kept_images": _image_payload_count(self.history)})
+            return False
         starts = [i for i, m in enumerate(self.history) if self._is_frame_user_message(m)]
         if len(starts) < 2:
             # one frame-turn holds the whole transcript (a long tool loop): shrink inside it
@@ -1987,8 +2094,20 @@ class TychoAgent(Agent):
                 and (builder_in_batch or wm_edit_in_batch or planner_in_batch)
             )
             results = []
+            script_started = None   # (session, choice, step) once a run_python script played (TYCHO_PY_ACTIONS)
             for c in calls:
                 cn = canonical(c["name"])
+                if cn == "run_python" and getattr(self, "py_actions", False) and script_started is None:
+                    out, script_started = self._run_python_acting(c.get("input") or {}, available_actions)
+                    results.append({"id": c["id"], "name": c["name"], "output": out})
+                    trace.append({"tool": cn, "args": c["input"], "result": _clip_trace(out),
+                                  **({"acting": True} if script_started else {})})
+                    continue
+                if cn == "take_action" and script_started is not None:
+                    results.append({"id": c["id"], "name": c["name"], "output": (
+                        "NOT executed: a run_python script in this reply is playing instead.")})
+                    trace.append({"tool": "take_action", "args": c.get("input", {}), "skipped": "script_acting"})
+                    continue
                 if cn == "take_action" and self.strict_receipts and c is not act_call:
                     # Only the first take_action of a reply runs. Saying "committed" for the others
                     # made the model believe moves were played that never happened.
@@ -2041,6 +2160,17 @@ class TychoAgent(Agent):
                     out = self.exec.execute(c["name"], c["input"])
                     results.append({"id": c["id"], "name": c["name"], "output": out})
                     trace.append({"tool": cn, "args": c["input"], "result": _clip_trace(out)})
+            if script_started is not None:
+                session, s_choice, s_step = script_started
+                if act_call is not None:   # a take_action earlier in the same reply: the script plays instead
+                    for r in results:
+                        if r["id"] == act_call["id"]:
+                            r["output"] = "NOT executed: a run_python script in this reply is playing instead."
+                self.history.append({"role": "tool", "results": results})
+                self._prepared_batch = None
+                self._prepared_script = (session, s_step)
+                trace.append({"tool": "take_action", "args": s_step, "committed": True, "src": "script"})
+                return s_choice, trace
             self.history.append({"role": "tool", "results": results})  # CLOSE the turn, always
             if act_call is not None and invalid_action_msg:
                 trace.append({"tool": "take_action", "args": act_call.get("input", {}),
@@ -2229,6 +2359,8 @@ class TychoAgent(Agent):
         if b["queue"] and b["queue"][0]["action"] not in avail:
             return "next_action_unavailable"
         grid = latest_frame.frame[-1]
+        if b.get("script") is not None:
+            return None   # a script observes no-ops itself and follows no validated plan
         if (getattr(self, "_last_action", None) not in (None, "RESET")
                 and self.level >= self.batch_noop_guard_from_level
                 and not _interior_changed(b["prev_grid"], grid, self.batch_border)):
@@ -2268,11 +2400,140 @@ class TychoAgent(Agent):
         self.turn_in_level += 1
         return choice
 
+    # ---- run_python scripts that play (TYCHO_PY_ACTIONS) ----
+    def _run_python_acting(self, args: dict, available_actions) -> tuple[str, tuple | None]:
+        """Run a run_python call that may call action(...). Returns (tool output, None) if the script ended
+        without playing, or (a 'playing' notice, (session, choice, step)) once it requested a legal action:
+        that action ends the decision and the script keeps playing from the next frame."""
+        code = args.get("code", "") if isinstance(args, dict) else ""
+        if not code.strip() or "action(" not in code:
+            return self.exec.execute("run_python", args), None
+        try:
+            timeout = max(1, min(300, int(args.get("timeout_s", 15))))
+        except (TypeError, ValueError):
+            timeout = 15
+        session = self.exec.start_script(code)
+        session.step_timeout = timeout
+        while True:
+            ev = session.next_event(timeout)
+            if "action" not in ev:
+                out = session.finish("it ran too long" if ev.get("timeout") else None)
+                if not ev.get("timeout") and "Traceback (most recent call last)" not in out:
+                    self.exec.retain(code)
+                if ev.get("timeout"):
+                    out = f"(run_python did not finish within {timeout}s)\n{out}"
+                return self.exec._portable_output(out or "(no output)"), None
+            step = {k: v for k, v in (("action", ev.get("action")), ("row", ev.get("row")),
+                                      ("col", ev.get("col"))) if v is not None}
+            choice, step_args, err = self._prepare_single_action(step, available_actions)
+            if not err and step_args["action"] == "RESET":
+                err = "RESET cannot be played from a script; end the script and use take_action RESET."
+            if err:
+                session.send({"error": err})
+                continue
+            label = self._action_label(step_args["action"], row=step_args.get("row"), col=step_args.get("col"))
+            return (f"Script is playing: it played {label} and goes on from the next frame (at most "
+                    f"{self.py_actions_max} actions). This ends your turn; what it prints and the actions it "
+                    "plays are reported with the frame after it ends."), (session, choice, step_args)
+
+    def _start_script_batch(self, session, step: dict, grid, game_avail: list[str]) -> None:
+        self._batch = {
+            "script": session,
+            "queue": [],
+            "labels": [self._action_label(step["action"], row=step.get("row"), col=step.get("col"))],
+            "planned": self.py_actions_max,
+            "executed": 1,  # the first action is returned by this turn
+            "dropped": 0,
+            "start_turn": self.turn_in_level,
+            "start_level": self.level,
+            "start_grid": [list(map(int, row)) for row in grid],
+            "prev_grid": [list(map(int, row)) for row in grid],
+            "game_actions": sorted(game_avail),
+        }
+
+    def _script_next(self, latest_frame, avail: list[str], available_actions, state: str):
+        """Send the script the frame its last action produced; return (next step, None) or (None, stop)."""
+        b = self._batch
+        session = b["script"]
+        if session.actions >= self.py_actions_max:
+            return None, "action_limit"
+        grid = [list(map(int, row)) for row in latest_frame.frame[-1]]
+        change = diff_text(b["prev_grid"], grid).splitlines()
+        changed = change[0] + ("; " + "; ".join(s.strip() for s in change[1:4]) if len(change) > 1 else "")
+        if getattr(self, "object_diff", False) and change[0] != "no cells changed":
+            changed = (self._object_changes(b["prev_grid"], grid) or "") + " | " + change[0]
+        session.send({"obs": {"grid": grid, "state": state, "levels_completed": int(latest_frame.levels_completed),
+                              "changed": changed, "available": list(avail)}})
+        while True:
+            ev = session.next_event(getattr(session, "step_timeout", 15))
+            if "action" not in ev:
+                return None, ("script_timeout" if ev.get("timeout") else "script_done")
+            step = {k: v for k, v in (("action", ev.get("action")), ("row", ev.get("row")),
+                                      ("col", ev.get("col"))) if v is not None}
+            choice, step_args, err = self._prepare_single_action(step, available_actions)
+            if not err and step_args["action"] == "RESET":
+                err = "RESET cannot be played from a script; end the script and use take_action RESET."
+            if err:
+                session.send({"error": err})
+                continue
+            return step_args, None
+
+    def _object_changes(self, prev, cur) -> str:
+        """TYCHO_OBJECT_DIFF: frame_diff_text of two grids on one line ('' when unavailable)."""
+        if prev is None or cur is None:
+            return ""
+        try:
+            from tycho.workspace.wmlib_template import frame_diff, frame_diff_text
+
+            text = frame_diff_text(frame_diff(prev, [list(map(int, r)) for r in cur]), max_items=4)
+        except Exception:  # noqa: BLE001 - a perception aid must never break a turn
+            return ""
+        return "" if text == "no object changes" else text.replace("\n", "; ")
+
+    def _object_changes_line(self, prev, cur, span: str) -> str:
+        if not getattr(self, "object_diff", False):
+            return ""
+        objects = self._object_changes(prev, cur)
+        return f" Object changes {span}: {objects}." if objects else ""
+
+    def _finish_script_batch(self, b: dict, stop: str | None, grid) -> None:
+        k = b["executed"]
+        ran = b["labels"][:k]
+        last = ran[-1] if ran else "?"
+        session = b["script"]
+        to_script = {"level_completed": "the level completed", "state_game_over": "the game ended (GAME_OVER)",
+                     "action_limit": f"it played the limit of {self.py_actions_max} actions",
+                     "available_actions_changed": "the available actions changed",
+                     "script_timeout": "it computed too long between actions"}.get(stop)
+        if stop is not None and stop.startswith("state_") and to_script is None:
+            to_script = f"the game state became {stop.removeprefix('state_').upper()}"
+        why = {None: "its code finished", "script_done": "its code finished",
+               "level_completed": f"action {k} ({last}) completed the level",
+               "state_game_over": f"action {k} ({last}) caused GAME_OVER and the level was reset"}.get(
+            stop, f"the harness stopped it: {to_script or stop}")
+        output = self.exec._portable_output(session.finish(to_script))
+        if "Traceback (most recent call last)" not in output:
+            self.exec.retain(getattr(session, "code", ""))
+        text = f"[script report] Your run_python script played {k} action(s): {', '.join(ran)}. It ended because {why}."
+        text += f"\nWhat it printed:\n{_clip_trace(output, cap=4000)}" if output else "\nIt printed nothing."
+        same_attempt = stop not in ("level_completed", "state_game_over") and self.level == b["start_level"]
+        if same_attempt and grid is not None and self.turn_in_level > b["start_turn"]:
+            ld = f"level_{self.level}"
+            text += (f"\nIntermediate frames: {ld}/turn_{b['start_turn'] + 1:03d}.txt to "
+                     f"turn_{self.turn_in_level:03d}.txt."
+                     + self._object_changes_line(b["start_grid"], grid, "over the whole script")
+                     + " Cell changes over the whole script:\n"
+                     + _clip_trace(diff_text(b["start_grid"], [list(map(int, row)) for row in grid]), cap=2500))
+        self._batch_report = {"text": text, "data": {"planned": b["planned"], "executed": k,
+                                                     "stop": stop or "script_done", "script": True}}
+
     def _finish_batch(self, stop: str | None, grid) -> None:
         """Close the running sequence and queue its report for the next turn's message."""
         b, self._batch = self._batch, None
         if b is None:
             return
+        if b.get("script") is not None:
+            return self._finish_script_batch(b, stop, grid)
         k, n = b["executed"], b["planned"]
         ran, skipped = b["labels"][:k], b["labels"][k:]
         last = ran[-1] if ran else "?"
@@ -2311,7 +2572,9 @@ class TychoAgent(Agent):
         if same_attempt and grid is not None and self.turn_in_level > b["start_turn"]:
             ld = f"level_{self.level}"
             text += (f"\nIntermediate frames: {ld}/turn_{b['start_turn'] + 1:03d}.txt to "
-                     f"turn_{self.turn_in_level:03d}.txt. Cell changes over the whole sequence:\n"
+                     f"turn_{self.turn_in_level:03d}.txt."
+                     + self._object_changes_line(b["start_grid"], grid, "over the whole sequence")
+                     + " Cell changes over the whole sequence:\n"
                      + _clip_trace(diff_text(b["start_grid"], [list(map(int, row)) for row in grid]), cap=2500))
         self._batch_report = {"text": text, "data": {"planned": n, "executed": k, "stop": stop,
                                                      "skipped": len(skipped), "dropped": b["dropped"]}}
@@ -2378,6 +2641,8 @@ class TychoAgent(Agent):
         self._level_builder_runs = 0
         self._level_auto_builder_fires = 0
         self._level_deaths = 0
+        self._level_resets = 0
+        self._level_critic_runs = 0
 
     def _level_actor_tokens_out(self) -> int:
         """Tokens the actor generated on this level (builder output excluded, so a build cannot
@@ -2401,6 +2666,56 @@ class TychoAgent(Agent):
         if self.builder_stuck_tokens > 0 and self._level_actor_tokens_out() >= self.builder_stuck_tokens * k:
             return True
         return self.builder_stuck_deaths > 0 and getattr(self, "_level_deaths", 0) >= self.builder_stuck_deaths * k
+
+    def _stuck_critic_due(self) -> bool:
+        """TYCHO_STUCK_CRITIC: a review once the level has cost another stuck_critic_tokens actor tokens, 2
+        GAME_OVERs or 3 RESETs since the last one, at most stuck_critic_max times per level."""
+        if not getattr(self, "stuck_critic", False) or self.turn_in_level == 0 or self.calls >= self.max_calls:
+            return False
+        k = getattr(self, "_level_critic_runs", 0)
+        if k >= self.settings.stuck_critic_max:
+            return False
+        need = k + 1
+        return (self._level_actor_tokens_out() >= self.settings.stuck_critic_tokens * need
+                or getattr(self, "_level_deaths", 0) >= 2 * need
+                or getattr(self, "_level_resets", 0) >= 3 * need)
+
+    def _run_stuck_critic(self, grid, game_avail: list[str]) -> None:
+        """One call in a FRESH context (observations and notes, not the actor's transcript) that proposes
+        alternative explanations and probes; its reply goes to the actor as advice. In 7 of 13 DeepSeek-V4
+        games that never cleared a level, the agent saw the decisive change and explained it away."""
+        self._level_critic_runs = getattr(self, "_level_critic_runs", 0) + 1
+        notes = self.ws.notes_digest(
+            [f"notes/level_{k}_insights.md" for k in range(max(0, self.level - 2), self.level)]
+            + ["notes/actor_beliefs.md"], max_bytes_each=3000)
+        prompt = render_prompt(
+            "critic.user", level=self.level, tokens_k=self._level_actor_tokens_out() // 1000,
+            deaths=getattr(self, "_level_deaths", 0), resets=getattr(self, "_level_resets", 0),
+            actions=list(game_avail) or ["(none)"], notes=notes, log=self.ws.attempt_logs(self.level))
+        content = [{"text": prompt}]
+        png = self.ws.current_png(self.level, self.turn_in_level) if self.vision else None
+        if png is not None:
+            content.append({"image_png": png})
+        else:
+            content.append({"text": "Current board:\n" + grid_text([list(map(int, r)) for r in grid])})
+        try:
+            reply = chat_tools([{"role": "user", "content": content}], [], self.cfg,
+                               system=render_prompt("critic.system"),
+                               max_tokens=max(self.max_tokens, 8192), effort=self.effort, call_type="critic")
+        except Exception as exc:  # noqa: BLE001 - advice is optional; never lose the turn over it
+            print(f"[tycho] stuck critic failed: {type(exc).__name__}: {exc}", flush=True)
+            return
+        self.calls += 1
+        usage = reply_usage(reply)
+        for key in ("tokens_in", "tokens_out", "cache_read", "cache_write"):
+            self.token_stats[key] = int(self.token_stats.get(key, 0)) + int(usage.get(key, 0))
+        # not actor tokens: a review must not bring the next one (or the stuck builder) forward
+        self._level_builder_tokens_out = getattr(self, "_level_builder_tokens_out", 0) + int(usage.get("tokens_out", 0))
+        text = (reply.get("text") or "").strip()
+        if text:
+            self.history.append({"role": "user", "content": (
+                "[fresh-eyes review: an independent reviewer saw only the recorded observations and your notes, "
+                "not your reasoning. Advisory: you decide.]\n" + text)})
 
     def _run_stuck_builder(self) -> None:
         self._level_auto_builder_fires = getattr(self, "_level_auto_builder_fires", 0) + 1
@@ -2563,6 +2878,12 @@ class TychoAgent(Agent):
         prompt_diff = diff
         if diff and not no_op and getattr(self, "diff_mode", "on") == "summary":
             prompt_diff = diff.splitlines()[0]
+        if getattr(self, "object_diff", False) and diff and not no_op:
+            # TYCHO_OBJECT_DIFF: the change as objects (moved/rotated, recolored, resized, appeared), as in
+            # Franzen's frame_diff, ahead of the exact cell changes
+            objects = self._object_changes(self.ws.level_grid(self.level, self.turn_in_level - 1), grid)
+            if objects:
+                prompt_diff = f"Objects: {objects}\nCells: {prompt_diff}"
         plan_hint = None
         if self._mode_spec.wm_variant != "none":
             plan_hint = self.ws.validated_plan_hint(
@@ -2575,15 +2896,40 @@ class TychoAgent(Agent):
             status = self._wm_status_line()
             if status:
                 plan_hint = f"{status}\n\n{plan_hint}" if plan_hint else status
+        # TYCHO_LEVEL_START_INLINE: turn 0 (game start, new level, restarted attempt) shows the grid
+        # even when text_grid=diff, and a new level inlines the carry-forward notes of the last three
+        # levels, so the first decision does not spend tool calls fetching them (DeepSeek-V4 spent 41%
+        # of its output tokens on level-start decisions that re-read notes, turn files and the grid).
+        inline_start = getattr(self, "level_start_inline", False) and self.turn_in_level == 0
+        carry_forward = None
+        if inline_start and frame_boundary == "level_start" and getattr(self, "ws", None) is not None:
+            notes = [f"notes/level_{k}_insights.md" for k in range(max(0, self.level - 3), self.level)]
+            carry_forward = "\n\n".join(filter(None, [
+                self.ws.notes_digest(notes, max_bytes_each=6000),
+                self.ws.notes_digest(["notes/actor_beliefs.md"], max_bytes_each=3000)])) or None
+            if getattr(self, "level_start_probe", False) and self.level > 0:
+                # TYCHO_LEVEL_START_PROBE: in 4 of 12 games stuck on level 2 the carried rules were right but
+                # the new level needed a mechanic the agent never found; list what is new on the board.
+                from tycho.workspace.workspace import board_novelty
+
+                prev = self.ws.level_grid(self.level - 1)
+                novelty = board_novelty(prev, [list(map(int, r)) for r in grid]) if prev else []
+                head = f"### New on this board (compared with level {self.level - 1}'s first board)\n"
+                body = ("\n".join(f"- {line}" for line in novelty) if novelty else
+                        "- no new colors or small shapes; expect the same mechanics, possibly at a larger scale")
+                probe = (head + body + "\nBefore reusing the earlier rules, probe what is new here and the actions "
+                         "the notes mark untested: one batch that tries each once costs a single turn. A level "
+                         "that adds objects usually adds a mechanic that the earlier goal now depends on.")
+                carry_forward = f"{carry_forward}\n\n{probe}" if carry_forward else probe
         # Assemble from actor.frame.j2 — the grid/diff/no-op/vision conditionals are {% if %} blocks
         # in the template now (were inline string-building here). turn-0 intro is handled in-template.
         return render_prompt(
             "actor.user", header=header, level=self.level, turn_in_level=self.turn_in_level,
             frame_boundary=frame_boundary, ld=ld, grid_text=gt,
             wm_variant=self._mode_spec.wm_variant,
-            show_grid=self.show_grid, show_diff=self.show_diff, vision=self.vision,
+            show_grid=self.show_grid or inline_start, show_diff=self.show_diff, vision=self.vision,
             diff=prompt_diff, no_op=no_op, last_action=getattr(self, "_last_action", None),
-            plan_hint=plan_hint,
+            plan_hint=plan_hint, carry_forward=carry_forward,
             turn3=f"{self.turn_in_level:03d}")
 
     def _truncate_old_grids(self):

@@ -207,6 +207,138 @@ def segment_summary(grid=None, background=None, include_background=False, max_co
     return "\n".join(lines)
 
 
+def frame_diff(before=None, after=None, background=None, large=400):
+    """Object-level changes between two grids (default: the last two frames of the current attempt).
+    Components are 4-connected same-color regions as in segment(). A component found in both frames with
+    the same color and shape is unchanged in place, "moved" when its position differs; one with the same
+    shape and place but another color "changed_color"; overlapping same-color components of different size
+    "resized" (often bars and counters); the rest "appeared" / "disappeared". Matching is by color and
+    shape only, so identical objects may be paired arbitrarily. Components over ``large`` cells (floors,
+    walls, panels) are counted in "regions_changed" instead of listed. Returns a dict of lists; each item
+    has color, size and bbox (r0, c0, r1, c1); "moved" items also have from_bbox and delta (drow, dcol)."""
+    if before is None or after is None:
+        fr = frames()
+        keys = sorted(fr)
+        if len(keys) < 2:
+            return {"changed_cells": 0, "moved": [], "changed_color": [], "resized": [], "appeared": [],
+                    "disappeared": [], "regions_changed": 0}
+        before, after = fr[keys[-2]], fr[keys[-1]]
+    b, a = np.asarray(before, dtype=np.int16), np.asarray(after, dtype=np.int16)
+    if background is None:
+        vals, cnts = np.unique(a, return_counts=True)
+        background = int(vals[cnts.argmax()])
+
+    def comps(g):
+        out = []
+        for p in segment(g, background=background, include_cells=True):
+            r0, c0, _, _ = p["bbox"]
+            p["mask"] = frozenset((r - r0, c - c0) for r, c in p["cells"])
+            out.append(p)
+        return out
+
+    cb, ca = comps(b), comps(a)
+    key = lambda p: (p["color"], p["bbox"], p["mask"])  # noqa: E731
+    same = {key(p) for p in cb} & {key(p) for p in ca}
+    rb = [p for p in cb if key(p) not in same]
+    ra = [p for p in ca if key(p) not in same]
+    item = lambda p: {"color": p["color"], "size": p["size"], "bbox": p["bbox"]}  # noqa: E731
+    res = {"changed_cells": int((b != a).sum()) if b.shape == a.shape else -1, "moved": [], "changed_color": [],
+           "resized": [], "appeared": [], "disappeared": [], "regions_changed": 0}
+    for p in [p for p in ra if p["size"] > large] + [p for p in rb if p["size"] > large]:
+        res["regions_changed"] += 1
+    ra = [p for p in ra if p["size"] <= large]
+    rb = [p for p in rb if p["size"] <= large]
+    def rotations(mask):
+        """{angle: normalized mask} for 90-degree clockwise rotations of a relative cell set."""
+        out, cur = {}, mask
+        for angle in (90, 180, 270):
+            cur = frozenset((c, -r) for r, c in cur)
+            r0 = min(r for r, _ in cur)
+            c0 = min(c for _, c in cur)
+            cur = frozenset((r - r0, c - c0) for r, c in cur)
+            out.setdefault(angle, cur)
+        return out
+
+    # moved (possibly rotated): same color and shape (up to rotation) elsewhere, closest pairs first
+    pairs = []
+    for p in ra:
+        rots = None
+        for q in rb:
+            if q["color"] != p["color"] or q["size"] != p["size"]:
+                continue
+            if q["mask"] == p["mask"]:
+                angle = 0
+            else:
+                rots = rots if rots is not None else rotations(q["mask"])
+                angle = next((ang for ang, m in rots.items() if m == p["mask"]), None)
+                if angle is None:
+                    continue
+            dist = abs(q["bbox"][0] - p["bbox"][0]) + abs(q["bbox"][1] - p["bbox"][1])
+            pairs.append((dist, id(p), id(q), p, q, angle))
+    used = set()
+    for dist, ip, iq, p, q, angle in sorted(pairs, key=lambda t: t[:3]):
+        if ip in used or iq in used:
+            continue
+        used.update((ip, iq))
+        moved = {**item(p), "from_bbox": q["bbox"], "delta": (p["bbox"][0] - q["bbox"][0], p["bbox"][1] - q["bbox"][1])}
+        if angle:
+            moved["rotated"] = angle
+        res["moved"].append(moved)
+    ra = [p for p in ra if id(p) not in used]
+    rb = [q for q in rb if id(q) not in used]
+    for p in list(ra):  # changed color: same shape, same place
+        q = next((q for q in rb if q["mask"] == p["mask"] and q["bbox"] == p["bbox"]), None)
+        if q is not None:
+            res["changed_color"].append({**item(p), "before": q["color"], "after": p["color"]})
+            ra.remove(p)
+            rb.remove(q)
+    for p in list(ra):  # resized: same color, overlapping boxes
+        def overlaps(q):
+            return not (q["bbox"][2] < p["bbox"][0] or q["bbox"][0] > p["bbox"][2]
+                        or q["bbox"][3] < p["bbox"][1] or q["bbox"][1] > p["bbox"][3])
+        q = next((q for q in rb if q["color"] == p["color"] and overlaps(q)), None)
+        if q is not None:
+            res["resized"].append({**item(p), "from_bbox": q["bbox"], "from_size": q["size"]})
+            ra.remove(p)
+            rb.remove(q)
+    res["appeared"] = [item(p) for p in ra]
+    res["disappeared"] = [item(p) for p in rb]
+    return res
+
+
+def frame_diff_text(diff, max_items=6) -> str:
+    """One compact line per kind of change in a frame_diff() result."""
+    def box(bb):
+        return f"rows {bb[0]}-{bb[2]}, cols {bb[1]}-{bb[3]}"
+
+    def direction(d):
+        dr, dc = d
+        parts = ([f"{'up' if dr < 0 else 'down'} {abs(dr)}"] if dr else []) + (
+            [f"{'left' if dc < 0 else 'right'} {abs(dc)}"] if dc else [])
+        return " and ".join(parts) or "in place"
+
+    def clip(items, fmt):
+        shown = [fmt(x) for x in items[:max_items]]
+        return "; ".join(shown) + (f"; +{len(items) - max_items} more" if len(items) > max_items else "")
+
+    lines = []
+    if diff["moved"]:
+        lines.append("moved: " + clip(diff["moved"], lambda x: (
+            f"color {x['color']} ({x['size']} cells) {direction(x['delta'])}"
+            + (f", rotated {x['rotated']} deg clockwise" if x.get("rotated") else "") + f" to {box(x['bbox'])}")))
+    if diff["changed_color"]:
+        lines.append("changed color: " + clip(diff["changed_color"], lambda x: f"{box(x['bbox'])} {x['before']}->{x['after']}"))
+    if diff["resized"]:
+        lines.append("resized: " + clip(diff["resized"], lambda x: f"color {x['color']} {x['from_size']}->{x['size']} cells, now {box(x['bbox'])}"))
+    if diff["appeared"]:
+        lines.append("appeared: " + clip(diff["appeared"], lambda x: f"color {x['color']} ({x['size']} cells) at {box(x['bbox'])}"))
+    if diff["disappeared"]:
+        lines.append("disappeared: " + clip(diff["disappeared"], lambda x: f"color {x['color']} ({x['size']} cells) from {box(x['bbox'])}"))
+    if diff["regions_changed"]:
+        lines.append(f"{diff['regions_changed']} large region(s) changed outline")
+    return "\n".join(lines) or "no object changes"
+
+
 def _runs(cols):
     """Collapse a sorted col list into comma-separated ranges: [36,37,38,40] -> '36-38,40'."""
     cs = sorted(cols); out = []; s = p = cs[0]

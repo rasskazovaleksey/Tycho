@@ -75,6 +75,20 @@ class TychoSettings:
     builder_max_tokens: int      # output cap per builder call (0 = max_tokens)
     wm_status_line: bool         # one verify line on every frame message while a world model exists
     plan_batch_hint: bool        # the plan hint offers the remaining validated plan as one sequence
+    level_start_inline: bool     # turn 0 inlines the grid; a new level also inlines the carry-forward notes
+    py_helpers: bool             # workspace helpers.py is imported into every run_python call
+    drain_images: str            # drain mode over the image cap only: drop (whole turns) | strip (images)
+    budget_prompt: bool          # actor prompt states the wall-clock cost of turns, exploration and RESET policy
+    scribe_mode: str             # level summary: tools (model writes the note with tools) | verified (harness saves the reply)
+    level_start_probe: bool      # a new level's start lists what is new on the board and asks to probe it first
+    py_actions: bool             # run_python may call action(...): the script plays and observes across steps
+    py_actions_max: int          # most actions one acting script may play
+    object_diff: bool            # per-turn and per-batch change reports lead with object-level changes
+    py_retain: bool              # top-level functions defined in run_python are kept for later calls
+    goal_hypotheses: bool        # actor keeps competing goal hypotheses and the probe that separates them
+    stuck_critic: bool           # a fresh-context reviewer proposes alternatives when a level is stuck
+    stuck_critic_tokens: int     # actor tokens on a level per critic review (also 2 GAME_OVERs / 3 RESETs)
+    stuck_critic_max: int        # critic reviews per level
 
     # ---- derived (not env): the two text-grid toggles _frame_message reads ----
     @property
@@ -138,6 +152,20 @@ class TychoSettings:
             builder_max_tokens=_envint("TYCHO_BUILDER_MAX_TOKENS", 0),
             wm_status_line=_envbool("TYCHO_WM_STATUS_LINE"),
             plan_batch_hint=_envbool("TYCHO_PLAN_BATCH_HINT"),
+            level_start_inline=_envbool("TYCHO_LEVEL_START_INLINE"),
+            py_helpers=_envbool("TYCHO_PY_HELPERS"),
+            drain_images=os.environ.get("TYCHO_DRAIN_IMAGES", "drop").lower(),
+            budget_prompt=_envbool("TYCHO_BUDGET_PROMPT"),
+            scribe_mode=os.environ.get("TYCHO_SCRIBE_MODE", "tools").lower(),
+            level_start_probe=_envbool("TYCHO_LEVEL_START_PROBE"),
+            py_actions=_envbool("TYCHO_PY_ACTIONS"),
+            py_actions_max=_envint("TYCHO_PY_ACTIONS_MAX", 30),
+            object_diff=_envbool("TYCHO_OBJECT_DIFF"),
+            py_retain=_envbool("TYCHO_PY_RETAIN"),
+            goal_hypotheses=_envbool("TYCHO_GOAL_HYPOTHESES"),
+            stuck_critic=_envbool("TYCHO_STUCK_CRITIC"),
+            stuck_critic_tokens=_envint("TYCHO_STUCK_CRITIC_TOKENS", 40000),
+            stuck_critic_max=_envint("TYCHO_STUCK_CRITIC_MAX", 2),
         )
         s._validate()
         return s
@@ -149,6 +177,10 @@ class TychoSettings:
         for f in ("max_inference_cost_per_game", "max_inference_cost_per_level"):
             if getattr(self, f) < 0:
                 raise ValueError(f"TychoSettings.{f} must be >= 0, got {getattr(self, f)}")
+        if self.scribe_mode not in ("tools", "verified"):
+            raise ValueError(f"TYCHO_SCRIBE_MODE={self.scribe_mode!r} not in tools | verified")
+        if self.drain_images not in ("drop", "strip"):
+            raise ValueError(f"TYCHO_DRAIN_IMAGES={self.drain_images!r} not in drop | strip")
         if self.builder_gate not in ("", "stuck"):
             raise ValueError(f"TYCHO_BUILDER_GATE={self.builder_gate!r} not in '' | stuck")
         if self.max_tool_steps < 1:

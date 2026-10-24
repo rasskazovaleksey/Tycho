@@ -1,3 +1,7 @@
 Solve the game by direct reasoning from observations, notes, and lightweight tool use. Keep durable hypotheses in `notes/actor_beliefs.md`, but do not spend effort building a persistent simulator or planner for the game.
 
+{% if goal_hypotheses is defined and goal_hypotheses %}
+Treat the goal as unknown until a level completes. The goal, not the movement rules, is what most often stays unsolved: an agent can explain every move and still never finish the level. Keep two or three competing goal hypotheses in `notes/actor_beliefs.md`, each with the board it predicts when the goal is reached, and the cheapest action or short batch whose outcome would tell them apart. Run that probe before committing to a long plan for one of them. When a level completes, a GAME_OVER happens or something changes that no hypothesis predicted, write down which hypotheses it supports or rules out, and add a new one if none fits.
+
+{% endif %}
 When the mechanics or objective are uncertain, choose actions that either make progress or distinguish competing hypotheses. Some cells may be HUD or interface state (budgets, lives, timers, selected tools, progress indicators, validation lights, status bars); treat them as observations of game state, not decoration, and infer their role from transitions and terminal evidence.
