@@ -145,6 +145,11 @@ def _grid_to_first(frame) -> Optional[list]:
     return [list(map(int, row)) for row in grid]
 
 
+class StopRun(Exception):
+    """Raised by an agent (or a hook an embedding runner installed on it) to end the run cleanly
+    between actions: the stop reason is the agent's ``done_reason``, and no error is recorded."""
+
+
 def _frame_sequence_to_list(frame) -> list[list[list[int]]]:
     if frame is None:
         return []
@@ -392,6 +397,9 @@ def run_env(
                 data=getattr(choice, "data", None),
                 reasoning=_engine_reasoning(choice.reasoning),  # engine-safe subset (16KB cap)
             )
+        except StopRun:
+            stop_reason = getattr(agent, "done_reason", None) or "agent_done"
+            break
         except Exception as e:  # noqa: BLE001 — preserve partial progress on any failure
             run_error = f"{type(e).__name__}: {e}"
             stop_reason = "exception"

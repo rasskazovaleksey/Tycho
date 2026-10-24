@@ -108,6 +108,9 @@ class TychoAgent(Agent):
 
     def __init__(self, tools=None):
         self.cfg = LLMConfig.from_env()
+        # Called with the latest frame right before a turn that may call the LLM (never mid-sequence);
+        # an embedding runner may block in it, e.g. to yield a shared inference slot. None: no hook.
+        self.before_decision = None
         # Reasoning. Default to "medium" when unset — ARC-AGI-3 is unsolvable without
         # reasoning, and an EMPTY effort silently disables thinking on ALL backends.
         # The 2026-06-17 Gemma run scored 0.28 with effort="" → thinking OFF for all 161
@@ -560,6 +563,9 @@ class TychoAgent(Agent):
             elif stop is None and self._batch["queue"]:
                 return self._continue_batch(latest_frame, available_actions, avail, game_avail, state)
             self._finish_batch(stop, grid)
+
+        if self.before_decision is not None:
+            self.before_decision(latest_frame)
 
         # --- LEVEL TRANSITION: levels_completed rose since last turn → a level was just solved.
         # First consolidate the just-finished level while the old-level transcript is still present;

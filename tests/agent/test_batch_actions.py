@@ -168,3 +168,17 @@ def test_flag_off_keeps_upstream_tool_surface(batch_env):
     take = next(t for t in agent._tools_with_available_actions(["ACTION1", "ACTION2"]) if t["name"] == "take_action")
     assert take["schema"]["properties"]["actions"]["items"]["properties"]["action"]["enum"] == ["ACTION1", "ACTION2"]
     assert "Committing several actions at once" in agent._sys
+
+
+def test_before_decision_runs_at_decisions_not_mid_sequence(batch_env):
+    """The hook an embedding runner yields its inference slot in: once before each LLM turn, including the
+    turn that closes a finished sequence, and never while a sequence plays out."""
+    with TemporaryDirectory() as td:
+        agent = _agent([_seq("ACTION1", "ACTION2"), _single("ACTION4")], td)
+        seen = []
+        agent.before_decision = lambda frame: seen.append(agent.chats)
+        agent.choose_action([], _frame(_grid(0)), ACTIONS)  # decision 1 commits the sequence
+        agent.choose_action([], _frame(_grid(1)), ACTIONS)  # its second action: no decision
+        assert seen == [0]
+        agent.choose_action([], _frame(_grid(2)), ACTIONS)  # the sequence is done: decision 2
+        assert seen == [0, 1] and agent.chats == 2

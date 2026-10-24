@@ -266,3 +266,46 @@ def test_run_env_routes_actor_reset_through_attempt_boundary():
     assert rec.resets == 1
     assert rec.total_actions == 2
     assert rec.reset_actions_counted is True
+
+
+def test_stop_run_from_choose_action_ends_cleanly_with_the_agents_reason():
+    from tycho.harness.harness import StopRun
+
+    class FakeEnv:
+        def reset(self):
+            return SimpleNamespace(frame=[[[0]]], levels_completed=0, state=GameState.NOT_FINISHED,
+                                   available_actions=[1])
+
+        def step(self, action, data=None, reasoning=None):
+            return self.reset()
+
+    class FakeArcade:
+        def make(self, game_id, seed=0, scorecard_id=None):
+            return FakeEnv()
+
+    class StoppingAgent:
+        calls = 0
+        max_calls = 10
+        builder = None
+        done_reason = None
+
+        def __init__(self):
+            self.choose_calls = 0
+
+        def reset(self, game_id, available_actions):
+            pass
+
+        def is_done(self, frames, latest_frame):
+            return False
+
+        def choose_action(self, frames, latest_frame, available_actions):
+            self.choose_calls += 1
+            if self.choose_calls == 2:
+                self.done_reason = "deadline"
+                raise StopRun("no slot")
+            return ActionChoice(GameAction.ACTION1)
+
+    rec = run_env(StoppingAgent(), FakeArcade(), "stop-game", [3], keep_trace=True)
+
+    assert rec.stop_reason == "deadline" and rec.error is None
+    assert rec.total_actions_including_unfinished == 1
