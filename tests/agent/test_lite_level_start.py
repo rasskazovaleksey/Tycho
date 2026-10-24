@@ -236,3 +236,29 @@ def test_builder_kickoff_inlines_its_notes(lite_env, monkeypatch):
         assert "First read" not in kickoffs[-1] and "inlined below" in kickoffs[-1]
         assert "### notes/actor_beliefs.md\nthe block moves 5 cells per action" in kickoffs[-1]
         assert "### world_model.py" not in kickoffs[-1]  # still the seed: nothing to show
+
+
+def test_level_history_keep_runs_the_transcript_into_the_next_level(lite_env):
+    lite_env.update({"TYCHO_LEVEL_START_INLINE": "1", "TYCHO_LEVEL_HISTORY": "keep"})
+    with TemporaryDirectory() as td:
+        agent = _agent(td)
+        _play_into_level_1(agent, "# Level 0 Insights\nGoal: make every panel match its clue.\n")
+        frames = [m for m in agent.history if agent._is_frame_user_message(m)]
+        assert len(frames) == 3 and agent.level == 1  # game start, turn 1, then the new level's start
+        level_start = agent.prompts[-1]
+        assert "continues above" in level_start and "was cleared" not in level_start
+        assert "Goal: make every panel match its clue." in level_start  # the notes are still inlined
+    lite_env["TYCHO_LEVEL_HISTORY"] = "reset"
+    with TemporaryDirectory() as td:
+        agent = _agent(td)
+        _play_into_level_1(agent, "# Level 0 Insights\nGoal: make every panel match its clue.\n")
+        assert sum(agent._is_frame_user_message(m) for m in agent.history) == 1
+        assert "was cleared" in agent.prompts[-1]
+
+
+def test_level_history_rejects_unknown_values(lite_env):
+    from tycho.config.settings import TychoSettings
+
+    lite_env["TYCHO_LEVEL_HISTORY"] = "carry"
+    with pytest.raises(ValueError, match="TYCHO_LEVEL_HISTORY"):
+        TychoSettings.from_env()

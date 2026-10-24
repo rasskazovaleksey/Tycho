@@ -162,6 +162,7 @@ class TychoAgent(Agent):
         self.drain_images = self.settings.drain_images
         self.scribe_mode = self.settings.scribe_mode
         self.level_start_probe = self.settings.level_start_probe
+        self.level_history = self.settings.level_history
         # H017 perception ablations — TYCHO_TEXT_GRID (full|diff|none) sets the STARTING grid/diff
         # toggles (show_grid/show_diff are derived properties on Settings); the agent can flip them
         # mid-game via set_verbosity. TYCHO_GRID_EMBEDS attaches the exact per-cell prompt_embeds.
@@ -573,15 +574,21 @@ class TychoAgent(Agent):
         level_just_completed = levels_done > self.prev_levels_done
         if level_just_completed:
             self._dispatch(Event.LEVEL_COMPLETE)  # boundary consolidation for the just-completed level
-            self._reset_history_for_new_level()   # THEN clear the transcript: each level is faced fresh,
-                                                  # carry-forward lives on disk (notes/ + world_model.py),
-                                                  # which the fresh-level frame message points the agent to.
+            # TYCHO_LEVEL_HISTORY=keep: the transcript runs on into the new level, as in Franzen's harness (M0),
+            # and drains bound it. Faced fresh, Qwen spent 12k tokens on a level's first decision and 1.6-3x
+            # M0's tokens on levels 2+ (runs/arc3-tycho-lite-v4-intel), re-deriving what the transcript held.
+            keep_history = getattr(self, "level_history", "reset") == "keep"
+            if not keep_history:
+                self._reset_history_for_new_level()   # THEN clear the transcript: each level is faced fresh,
+                                                      # carry-forward lives on disk (notes/ + world_model.py),
+                                                      # which the fresh-level frame message points the agent to.
             self.level += 1
             self.turn_in_level = 0
             self._reset_animation_summary_level_state()
             self._reset_level_counters()
             self.ws.new_level()               # fresh grid; no cross-level diff
-            self.reset_reasoning_chain()      # SERVER chain re-establishes from the (now-empty) history
+            if not keep_history:
+                self.reset_reasoning_chain()  # SERVER chain re-establishes from the (now-empty) history
             self._pending_frame_boundary = "level_start"
         self.prev_levels_done = levels_done
 
@@ -1831,9 +1838,14 @@ class TychoAgent(Agent):
                     break
         dropped_turns = sum(1 for i in starts if i < cut)
         kept = self.history[cut:]
-        note = (f"[context drained: the {dropped_turns} oldest frame-turn(s) of this level were removed to fit "
-                f"the context window. This is not a game event. Their frames and diffs are on disk under "
-                f"level_{self.level}/; notes/ holds what you wrote.]")
+        if getattr(self, "level_history", "reset") == "keep":  # the transcript may reach back into earlier levels
+            note = (f"[context drained: the {dropped_turns} oldest frame-turn(s) of this conversation were removed to "
+                    f"fit the context window. This is not a game event. Their frames and diffs are on disk under "
+                    f"level_<L>/; notes/ holds what you wrote.]")
+        else:
+            note = (f"[context drained: the {dropped_turns} oldest frame-turn(s) of this level were removed to fit "
+                    f"the context window. This is not a game event. Their frames and diffs are on disk under "
+                    f"level_{self.level}/; notes/ holds what you wrote.]")
         first = dict(kept[0])
         first["content"] = [{"text": note}, *first["content"]]
         self.history = [first, *kept[1:]]
@@ -2936,6 +2948,7 @@ class TychoAgent(Agent):
             show_grid=self.show_grid or inline_start, show_diff=self.show_diff, vision=self.vision,
             diff=prompt_diff, no_op=no_op, last_action=getattr(self, "_last_action", None),
             plan_hint=plan_hint, carry_forward=carry_forward,
+            history_kept=getattr(self, "level_history", "reset") == "keep",
             turn3=f"{self.turn_in_level:03d}")
 
     def _truncate_old_grids(self):

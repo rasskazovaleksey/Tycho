@@ -89,6 +89,7 @@ class TychoSettings:
     stuck_critic: bool           # a fresh-context reviewer proposes alternatives when a level is stuck
     stuck_critic_tokens: int     # actor tokens on a level per critic review (also 2 GAME_OVERs / 3 RESETs)
     stuck_critic_max: int        # critic reviews per level
+    level_history: str           # at a level boundary: reset (upstream: fresh conversation) | keep (drains bound it)
 
     # ---- derived (not env): the two text-grid toggles _frame_message reads ----
     @property
@@ -166,6 +167,7 @@ class TychoSettings:
             stuck_critic=_envbool("TYCHO_STUCK_CRITIC"),
             stuck_critic_tokens=_envint("TYCHO_STUCK_CRITIC_TOKENS", 40000),
             stuck_critic_max=_envint("TYCHO_STUCK_CRITIC_MAX", 2),
+            level_history=os.environ.get("TYCHO_LEVEL_HISTORY", "reset").lower(),
         )
         s._validate()
         return s
@@ -181,6 +183,8 @@ class TychoSettings:
             raise ValueError(f"TYCHO_SCRIBE_MODE={self.scribe_mode!r} not in tools | verified")
         if self.drain_images not in ("drop", "strip"):
             raise ValueError(f"TYCHO_DRAIN_IMAGES={self.drain_images!r} not in drop | strip")
+        if self.level_history not in ("reset", "keep"):
+            raise ValueError(f"TYCHO_LEVEL_HISTORY={self.level_history!r} not in reset | keep")
         if self.builder_gate not in ("", "stuck"):
             raise ValueError(f"TYCHO_BUILDER_GATE={self.builder_gate!r} not in '' | stuck")
         if self.max_tool_steps < 1:

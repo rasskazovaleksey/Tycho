@@ -12,13 +12,21 @@
       plan_hint           : guarded next action from a canonically validated plan, or None
       carry_forward       : carry-forward notes inlined at a level start (TYCHO_LEVEL_START_INLINE),
                             None or undefined otherwise
+      history_kept        : the conversation runs on across level boundaries (TYCHO_LEVEL_HISTORY=keep)
       turn3               : f"{turn_in_level:03d}" (the zero-padded turn, for file paths)
     Whitespace is exact-matched to the old string concat (header + "\n" + intro + grid + change +
     "\n(Also saved …)") — the equivalence test pins it. `~` is Jinja string concat. -#}
 {{ header }}
 {% if turn_in_level == 0 %}
 {% if frame_boundary == 'level_start' %}
+{% if history_kept is defined and history_kept %}
+A new, likely harder level begins now — a fresh grid. Your conversation from the earlier levels continues above (its oldest turns may have been drained); notes/ holds what you wrote at each boundary. What you learned about the objects, actions and goal probably still holds: start from it, but check what is new on this board.
 {% if carry_forward is defined and carry_forward %}
+
+{{ carry_forward }}
+
+{% endif %}
+{% elif carry_forward is defined and carry_forward %}
 A new, likely harder level begins now — a fresh grid. Your conversation was cleared at the boundary; your carry-forward notes are inlined below, so there is no need to re-read them (the files of earlier levels stay on disk for details).
 {% if wm_variant != 'none' %}
 If you have derived a reliable world model for the game, then use it before acting. You can also check the new init frame and whether init_state() still holds.
